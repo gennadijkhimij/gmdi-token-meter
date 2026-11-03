@@ -78,6 +78,7 @@ foreach ($dir in $configDirs) {
 # 2. Кожен акаунт: прибрати стару копію з env, підключити маркетплейс і мод.
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $oldNorm = Norm $OldCopy
+$connected = @()
 foreach ($a in $accounts) {
   $settings = $a.Settings
   $label = Split-Path $a.Dir -Leaf
@@ -109,6 +110,7 @@ foreach ($a in $accounts) {
   }
   Set-Prop $settings.enabledPlugins "$Plugin@$Market" $true
 
+  $connected += $a.Dir
   $json = $settings | ConvertTo-Json -Depth 100
   if ($json -eq $a.Raw) {
     if (-not $Quiet) { Write-Host "[$label] уже підключено." -ForegroundColor Green }
@@ -120,7 +122,42 @@ foreach ($a in $accounts) {
   Write-Host "[$label] підключено з GitHub, автооновлення ввімкнено." -ForegroundColor Green
 }
 
-# 3. Стара копія з архіву-інсталятора більше не потрібна, якщо на неї не посилається жоден акаунт.
+# 3. Поставити мод одразу, якщо знайдено claude.exe (застосунок Claude або claude у PATH).
+#    Без нього Claude поставить мод сам під час наступного запуску, за записами в settings.json.
+function Find-Engine {
+  $exe = Get-ChildItem -Path $env:APPDATA -Directory -Filter 'Claude*' -ErrorAction SilentlyContinue |
+    ForEach-Object { Get-ChildItem (Join-Path $_.FullName 'claude-code') -Recurse -Filter claude.exe -ErrorAction SilentlyContinue } |
+    Sort-Object { try { [version]($_.Directory.Parent.Name -replace '[^\d.]', '') } catch { [version]'0.0' } } -Descending |
+    Select-Object -First 1 -ExpandProperty FullName
+  if ($exe) { return $exe }
+  $cmd = Get-Command claude -ErrorAction SilentlyContinue
+  if ($cmd) { return $cmd.Source }
+}
+
+$todo = @($connected | Where-Object {
+  $list = Join-Path $_ 'plugins\installed_plugins.json'
+  -not ((Test-Path -LiteralPath $list) -and ([IO.File]::ReadAllText($list, $utf8) -like "*`"$Plugin@$Market`"*"))
+})
+if ($todo) {
+  $engine = Find-Engine
+  if ($engine) {
+    $savedConfig = $env:CLAUDE_CONFIG_DIR
+    $savedDirs = $env:CLAUDE_CODE_PLUGIN_DIRS
+    Remove-Item Env:CLAUDE_CODE_PLUGIN_DIRS -ErrorAction SilentlyContinue
+    foreach ($dir in $todo) {
+      $label = Split-Path $dir -Leaf
+      $env:CLAUDE_CONFIG_DIR = $dir
+      $null = & $engine plugin marketplace add $Repo 2>&1
+      $out = & $engine plugin install "$Plugin@$Market" --scope user 2>&1 | Out-String
+      if ($out -match 'Successfully installed|already installed') { Write-Host "[$label] мод встановлено." -ForegroundColor Green }
+      else { Write-Host "[$label] не вдалося встановити зараз; Claude поставить мод під час наступного запуску." -ForegroundColor Yellow }
+    }
+    $env:CLAUDE_CONFIG_DIR = $savedConfig
+    if ($savedDirs) { $env:CLAUDE_CODE_PLUGIN_DIRS = $savedDirs }
+  }
+}
+
+# 4. Стара копія з архіву-інсталятора більше не потрібна, якщо на неї не посилається жоден акаунт.
 if (Test-Path -LiteralPath $OldCopy) {
   # Перевіряємо всі акаунти ПК, а не лише ті, що змінювали (-ConfigDir).
   $used = $false
