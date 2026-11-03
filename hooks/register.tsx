@@ -241,18 +241,22 @@ async function change($: EngineInterface, ttl: '1h' | '5m', key: SettingKey, fn:
   await saving
 }
 
-// The main loop got a response: the prompt cache was read or written just now, for this model.
-async function touch($: EngineInterface) {
+// The main loop got a response: the prompt cache was read or written just now, for the model
+// that answered (a fallback can answer for the one picked), or the session's when the reply names none.
+async function touch($: EngineInterface, answered: string | undefined) {
   const now = await $.clock.now()
-  const id = await $.session.model()
+  const id = answered || (await $.session.model())
   await update($, lastReplyAt, () => now)
   await update($, replyModel, () => id)
 }
 
+// One model under its ids: the session's and the API's may differ by a context tag or a date.
+const modelKey = (id: string): string => id.toLowerCase().replace(/\[[^\]]*\]$/, '').replace(/-\d{8}$/, '')
+
 // When the cache the next request would read was last written: none once the session
 // has switched to a model other than the one that replied (state from before 0.2.1 has no model).
 const cacheFrom = (replyAt: number | null, replyId: string | null, modelId: string | null): number | null =>
-  replyAt !== null && (replyId === null || replyId === modelId) ? replyAt : null
+  replyAt !== null && (replyId === null || (modelId !== null && modelKey(replyId) === modelKey(modelId))) ? replyAt : null
 
 // The model the next request goes to (a /model switch included): the price follows it.
 async function refreshModel($: EngineInterface) {
@@ -344,7 +348,7 @@ export const register: Register = (on, options) => {
       warming = false
     }
     if (!e.agentId && e.usage) {
-      await touch($)
+      await touch($, e.usage.model)
       await refreshModel($)
     }
 

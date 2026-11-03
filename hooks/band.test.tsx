@@ -397,10 +397,34 @@ test('a model switch leaves the cache cold until that model replies, so the warm
   await clock.advance(55 * 60_000)
   expect(sent).toEqual([])
 
-  // Sonnet replies: its cache is warm from now on.
-  await $.turn.complete(ANSWERED)
+  // Sonnet replies (the API names it with a date): its cache is warm from now on.
+  await $.turn.complete({ ...ANSWERED, usage: { ...ANSWERED.usage!, model: 'claude-sonnet-5-20261001' } })
   await clock.advance(1_000)
   expect((await ui.find({ type: 'Text', text: /ТЕПЛО/ }))?.text).toBe(' ТЕПЛО ')
+  await ui.unmount()
+})
+
+test('a reply from a fallback model warms its cache, not the picked one\'s', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const sent: string[] = []
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('prompt.submit', (_, e) => {
+    sent.push(e.text)
+    return { text: e.text }
+  })
+  on('session.model', () => ({ value: 'claude-sonnet-5' }))
+  on('session.usage', () => ({ value: { startedAt: NOW, context: { tokens: 207_000, window: 1_000_000 }, rateLimits: [] } }))
+  on('turn.complete', () => ({ text: 'ok' }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  // Sonnet is picked, Opus answered: the next request, on Sonnet, has no cache to read.
+  await $.turn.complete(ANSWERED)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /ХОЛОД/ }))?.text).toBe(' ХОЛОД ')
+  await clock.advance(56 * 60_000)
+  expect(sent).toEqual([])
   await ui.unmount()
 })
 
@@ -445,7 +469,7 @@ test('Haiku 5.5 past 100K tokens pays the dearer tier, at 100K and below the che
   on('turn.complete', () => ({ text: 'ok' }))
 
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  await $.turn.complete(ANSWERED)
+  await $.turn.complete({ ...ANSWERED, usage: { ...ANSWERED.usage!, model: 'claude-haiku-5-5' } })
 
   // 149k: $0.50/M × 2 for the write.
   const long = await $.ui.mount({ ...BAND, surface: 'desktop' })

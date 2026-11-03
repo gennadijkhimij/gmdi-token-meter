@@ -70,9 +70,36 @@ function Find-Engine {
   if ($cmd) { return $cmd.Source }
 }
 
+# Мод справді встановлено: запис user у реєстрі, і в його теці є маніфест мода.
 function Test-Installed([string]$dir) {
   $list = Join-Path $dir 'plugins\installed_plugins.json'
-  (Test-Path -LiteralPath $list) -and ([IO.File]::ReadAllText($list, $utf8) -like "*`"$Key`"*")
+  if (-not (Test-Path -LiteralPath $list)) { return $false }
+  try { $reg = [IO.File]::ReadAllText($list, $utf8) | ConvertFrom-Json } catch { return $false }
+  if (-not $reg.plugins -or -not $reg.plugins.PSObject.Properties[$Key]) { return $false }
+  foreach ($i in @($reg.plugins.$Key)) {
+    if ($i.scope -eq 'user' -and $i.installPath -and (Test-Path -LiteralPath (Join-Path $i.installPath '.claude-plugin\plugin.json'))) { return $true }
+  }
+  return $false
+}
+
+# Команда рушія без винятків від stderr (PowerShell 5.1); повертає код завершення і вивід.
+function Invoke-Engine([string]$dir, [string[]]$arguments) {
+  $savedConfig = $env:CLAUDE_CONFIG_DIR
+  $savedDirs = $env:CLAUDE_CODE_PLUGIN_DIRS
+  $savedPref = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    Remove-Item Env:CLAUDE_CODE_PLUGIN_DIRS -ErrorAction SilentlyContinue
+    $env:CLAUDE_CONFIG_DIR = $dir
+    $out = (& $engine @arguments 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out.Trim() }
+  } catch {
+    [pscustomobject]@{ Code = -1; Out = "$_" }
+  } finally {
+    $ErrorActionPreference = $savedPref
+    $env:CLAUDE_CONFIG_DIR = $savedConfig
+    if ($savedDirs) { $env:CLAUDE_CODE_PLUGIN_DIRS = $savedDirs }
+  }
 }
 
 function Get-PluginDirs($settings) {
@@ -108,6 +135,7 @@ foreach ($dir in $configDirs) {
 $engine = Find-Engine
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $oldNorm = Norm $OldCopy
+$failed = 0
 
 foreach ($a in $accounts) {
   $s = $a.Settings
@@ -141,46 +169,49 @@ foreach ($a in $accounts) {
     $backup = "$($a.Path).bak-$stamp"
     Copy-Item -LiteralPath $a.Path -Destination $backup
   }
-  New-Item -ItemType Directory -Force -Path $a.Dir | Out-Null
-  [IO.File]::WriteAllText($a.Path, ($s | ConvertTo-Json -Depth 100), $utf8)
 
-  # 3. Встановити рушієм і переконатися, що мод на місці.
-  if (-not (Test-Installed $a.Dir) -and $engine) {
-    $savedConfig = $env:CLAUDE_CONFIG_DIR
-    $savedDirs = $env:CLAUDE_CODE_PLUGIN_DIRS
-    Remove-Item Env:CLAUDE_CODE_PLUGIN_DIRS -ErrorAction SilentlyContinue
-    try {
-      $env:CLAUDE_CONFIG_DIR = $a.Dir
-      $null = & $engine plugin marketplace add $Repo 2>&1
-      $null = & $engine plugin install $Key --scope user 2>&1
-    } finally {
-      $env:CLAUDE_CONFIG_DIR = $savedConfig
-      if ($savedDirs) { $env:CLAUDE_CODE_PLUGIN_DIRS = $savedDirs }
+  # 3–4 як одна дія: будь-який збій повертає settings.json як був, стара версія лишається.
+  try {
+    New-Item -ItemType Directory -Force -Path $a.Dir | Out-Null
+    [IO.File]::WriteAllText($a.Path, ($s | ConvertTo-Json -Depth 100), $utf8)
+
+    # 3. Встановити рушієм і переконатися, що мод на місці.
+    $why = $null
+    if (-not (Test-Installed $a.Dir)) {
+      if (-not $engine) { throw 'не знайдено застосунок Claude (claude.exe)' }
+      $r = Invoke-Engine $a.Dir @('plugin', 'marketplace', 'add', $Repo)
+      if ($r.Code -ne 0) { $why = "plugin marketplace add: $($r.Out)" }
+      $r = Invoke-Engine $a.Dir @('plugin', 'install', $Key, '--scope', 'user')
+      if ($r.Code -ne 0) { $why = "plugin install: $($r.Out)" }
     }
-  }
-  if (-not (Test-Installed $a.Dir)) {
-    if ($null -eq $a.Raw) { Remove-Item -LiteralPath $a.Path -Force } else { [IO.File]::WriteAllText($a.Path, $a.Raw, $utf8) }
-    if ($backup) { Remove-Item -LiteralPath $backup -Force }
-    $why = if ($engine) { 'Claude не зміг його встановити (немає мережі чи доступу до github.com?)' } else { 'не знайдено застосунок Claude (claude.exe)' }
-    Write-Host "[$label] мод не встановлено: $why. Налаштування не змінено, стара версія (якщо була) лишається." -ForegroundColor Yellow
+    if (-not (Test-Installed $a.Dir)) {
+      if (-not $why) { $why = 'після встановлення мода немає в реєстрі Claude' }
+      throw $why
+    }
+
+    # 4. Новий мод на місці. `plugin marketplace add` переписує settings.json і буває губить autoUpdate:
+    #    перечитати файл, повернути autoUpdate і прибрати стару копію з env.
+    $now = [IO.File]::ReadAllText($a.Path, $utf8)
+    $s = $now | ConvertFrom-Json
+    if ($s.extraKnownMarketplaces -and $s.extraKnownMarketplaces.PSObject.Properties[$Market]) {
+      Set-Prop $s.extraKnownMarketplaces.$Market 'autoUpdate' $true
+    }
+    $entries = Get-PluginDirs $s
+    if (@($entries | Where-Object { (Norm $_) -eq $oldNorm })) {
+      $rest = @($entries | Where-Object { (Norm $_) -ne $oldNorm })
+      if ($rest) { Set-Prop $s.env 'CLAUDE_CODE_PLUGIN_DIRS' ($rest -join ';') }
+      else { $s.env.PSObject.Properties.Remove('CLAUDE_CODE_PLUGIN_DIRS') }
+    }
+    $json = $s | ConvertTo-Json -Depth 100
+    if (($now | ConvertFrom-Json | ConvertTo-Json -Depth 100) -ne $json) { [IO.File]::WriteAllText($a.Path, $json, $utf8) }
+  } catch {
+    if ($null -eq $a.Raw) { Remove-Item -LiteralPath $a.Path -Force -ErrorAction SilentlyContinue } else { [IO.File]::WriteAllText($a.Path, $a.Raw, $utf8) }
+    if ($backup) { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue }
+    Write-Host "[$label] мод не встановлено: $($_.Exception.Message). Налаштування не змінено, стара версія (якщо була) лишається." -ForegroundColor Yellow
+    $failed++
     continue
   }
 
-  # 4. Новий мод на місці. `plugin marketplace add` переписує settings.json і буває губить autoUpdate:
-  #    перечитати файл, повернути autoUpdate і прибрати стару копію з env.
-  $now = [IO.File]::ReadAllText($a.Path, $utf8)
-  $s = $now | ConvertFrom-Json
-  if ($s.extraKnownMarketplaces -and $s.extraKnownMarketplaces.PSObject.Properties[$Market]) {
-    Set-Prop $s.extraKnownMarketplaces.$Market 'autoUpdate' $true
-  }
-  $entries = Get-PluginDirs $s
-  if (@($entries | Where-Object { (Norm $_) -eq $oldNorm })) {
-    $rest = @($entries | Where-Object { (Norm $_) -ne $oldNorm })
-    if ($rest) { Set-Prop $s.env 'CLAUDE_CODE_PLUGIN_DIRS' ($rest -join ';') }
-    else { $s.env.PSObject.Properties.Remove('CLAUDE_CODE_PLUGIN_DIRS') }
-  }
-  $json = $s | ConvertTo-Json -Depth 100
-  if (($now | ConvertFrom-Json | ConvertTo-Json -Depth 100) -ne $json) { [IO.File]::WriteAllText($a.Path, $json, $utf8) }
   [IO.File]::WriteAllText($markerPath, "$stamp $Repo`n", $utf8)
   if ($backup -and $a.Raw -eq [IO.File]::ReadAllText($a.Path, $utf8)) { Remove-Item -LiteralPath $backup -Force }
   Write-Host "[$label] мод встановлено, автооновлення ввімкнено." -ForegroundColor Green
@@ -204,5 +235,6 @@ if (Test-Path -LiteralPath $OldCopy) {
 
 if ($Quiet) { return }
 Write-Host ''
+if ($failed) { Write-Host "Не встановлено в акаунтах: $failed. Причина — вище; повторіть, коли буде доступ до github.com." -ForegroundColor Yellow; exit 2 }
 Write-Host 'Готово. Закрийте й знову відкрийте застосунок Claude: смуга з''явиться над полем вводу.'
 Write-Host 'Далі Claude перевірятиме оновлення під час кожного запуску й ставитиме їх сам.'
