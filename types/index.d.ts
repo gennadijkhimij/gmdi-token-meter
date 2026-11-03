@@ -37,6 +37,7 @@ declare module 'claude-code' {
       costUsd: number | null
       startedAt: number | null
       lastReplyAt: number | null
+      replyModel: string | null
       model: string | null
       settings: Settings | null
       view: View

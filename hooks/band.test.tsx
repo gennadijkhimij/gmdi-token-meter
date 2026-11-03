@@ -361,12 +361,47 @@ test('the price follows a model switch before the next reply', async ($, on) => 
   expect((await opus.find({ type: 'Text', text: /→/ }))?.text).toBe('→ $1.66')
   await opus.unmount()
 
-  // /model sonnet-5: within the timer's 30 seconds the price is Sonnet's ($2/M × 2).
+  // /model sonnet-5: within the timer's 30 seconds the price is Sonnet's ($2/M × 2),
+  // and due on the next request, as Sonnet has no cache of this context yet.
   current = 'claude-sonnet-5'
   await clock.advance(30_000)
   const sonnet = await $.ui.mount({ ...BAND, surface: 'desktop' })
-  expect((await sonnet.find({ type: 'Text', text: /→/ }))?.text).toBe('→ $0.83')
+  expect((await sonnet.find({ type: 'Text', text: /^продовження / }))?.text).toBe('продовження $0.83')
   await sonnet.unmount()
+})
+
+test('a model switch leaves the cache cold until that model replies, so the warmer keeps still', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const sent: string[] = []
+  let current = 'claude-opus-5-5'
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('prompt.submit', (_, e) => {
+    sent.push(e.text)
+    return { text: e.text }
+  })
+  on('session.model', () => ({ value: current }))
+  on('session.usage', () => ({ value: { startedAt: NOW, context: { tokens: 207_000, window: 1_000_000 }, rateLimits: [] } }))
+  on('turn.complete', () => ({ text: 'ok' }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /ТЕПЛО/ }))?.text).toBe(' ТЕПЛО ')
+
+  // /model sonnet-5 with no reply from it: Sonnet's cache is cold, and no warm-up is due.
+  current = 'claude-sonnet-5'
+  await clock.advance(30_000)
+  expect((await ui.find({ type: 'Text', text: /ХОЛОД/ }))?.text).toBe(' ХОЛОД ')
+  await clock.advance(55 * 60_000)
+  expect(sent).toEqual([])
+
+  // Sonnet replies: its cache is warm from now on.
+  await $.turn.complete(ANSWERED)
+  await clock.advance(1_000)
+  expect((await ui.find({ type: 'Text', text: /ТЕПЛО/ }))?.text).toBe(' ТЕПЛО ')
+  await ui.unmount()
 })
 
 test('a failed store write is told in a toast, and the change still holds for the session', async ($, on) => {

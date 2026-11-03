@@ -10,6 +10,8 @@ const context = atom({ plugin: 'gmdi-token-meter', key: 'context' } as const, nu
 const costUsd = atom({ plugin: 'gmdi-token-meter', key: 'costUsd' } as const, null as number | null)
 const startedAt = atom({ plugin: 'gmdi-token-meter', key: 'startedAt' } as const, null as number | null)
 const lastReplyAt = atom({ plugin: 'gmdi-token-meter', key: 'lastReplyAt' } as const, null as number | null)
+// The model that gave that reply: the prompt cache is per model, so another one starts cold.
+const replyModel = atom({ plugin: 'gmdi-token-meter', key: 'replyModel' } as const, null as string | null)
 const model = atom({ plugin: 'gmdi-token-meter', key: 'model' } as const, null as string | null)
 // The person's choices; null until session.start has read them from the store.
 const settings = atom({ plugin: 'gmdi-token-meter', key: 'settings' } as const, null as Settings | null)
@@ -239,11 +241,18 @@ async function change($: EngineInterface, ttl: '1h' | '5m', key: SettingKey, fn:
   await saving
 }
 
-// The main loop got a response: the prompt cache was read or written just now.
+// The main loop got a response: the prompt cache was read or written just now, for this model.
 async function touch($: EngineInterface) {
   const now = await $.clock.now()
+  const id = await $.session.model()
   await update($, lastReplyAt, () => now)
+  await update($, replyModel, () => id)
 }
+
+// When the cache the next request would read was last written: none once the session
+// has switched to a model other than the one that replied (state from before 0.2.1 has no model).
+const cacheFrom = (replyAt: number | null, replyId: string | null, modelId: string | null): number | null =>
+  replyAt !== null && (replyId === null || replyId === modelId) ? replyAt : null
 
 // The model the next request goes to (a /model switch included): the price follows it.
 async function refreshModel($: EngineInterface) {
@@ -263,7 +272,8 @@ async function maybeWarm($: EngineInterface) {
   if (!cfg) return
   const now = await $.clock.now()
   const w = (await read($, warm)) as Warm
-  const status = warmStatus(cfg, w, await read($, lastReplyAt), now, (await read($, context))?.tokens ?? 0, await read($, limits))
+  const cacheAt = cacheFrom(await read($, lastReplyAt), await read($, replyModel), await read($, model))
+  const status = warmStatus(cfg, w, cacheAt, now, (await read($, context))?.tokens ?? 0, await read($, limits))
   if (status.kind !== 'armed' || now < status.at) return
 
   warming = true
@@ -375,9 +385,10 @@ export const register: Register = (on, options) => {
     const modelId = await read($, model)
     const ctxTokens = ctx?.tokens ?? 0
     const w = (await read($, warm)) as Warm
-    const warmNow = warmStatus(cfg, w, replyAt, now, ctxTokens, rows)
+    const cacheAt = cacheFrom(replyAt, await read($, replyModel), modelId)
+    const warmNow = warmStatus(cfg, w, cacheAt, now, ctxTokens, rows)
 
-    const cacheLeft = replyAt === null ? 0 : replyAt + ttlMs - now
+    const cacheLeft = cacheAt === null ? 0 : cacheAt + ttlMs - now
     const isWarm = cacheLeft > 0
     const cacheColor = isWarm ? '#e5484d' : '#4c8dff'
     // While Claude works its requests write the cache, so the countdown gives way to «working».
