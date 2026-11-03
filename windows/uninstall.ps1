@@ -45,29 +45,38 @@ if ($ConfigDir) { $configDirs = @(Norm $ConfigDir) } else { $configDirs = @(Find
 $engine = Find-Engine
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
-# Стан у реєстрі Claude: 'yes', 'no' або 'error' (реєстр не читається — нічого не робимо).
+# Стан user-встановлення в реєстрі Claude: 'yes', 'no' або 'error' (реєстр не читається — нічого не робимо).
+# Встановлення інших областей (project, local) не чіпаємо й не враховуємо.
 function Get-RegState([string]$dir) {
   $list = Join-Path $dir 'plugins\installed_plugins.json'
   if (-not (Test-Path -LiteralPath $list)) { return 'no' }
   try { $reg = [IO.File]::ReadAllText($list, $utf8) | ConvertFrom-Json } catch { return 'error' }
-  if ($reg.plugins -and $reg.plugins.PSObject.Properties[$Key] -and @($reg.plugins.$Key).Count -gt 0) { 'yes' } else { 'no' }
+  if (-not $reg.plugins -or -not $reg.plugins.PSObject.Properties[$Key]) { return 'no' }
+  if (@($reg.plugins.$Key | Where-Object { $_.scope -eq 'user' }).Count -gt 0) { 'yes' } else { 'no' }
 }
 
-# Звідки маркетплейс gmdi в акаунті: наш repo, чужий, або його немає ('').
-function Get-MarketRepo([string]$dir, $settings) {
-  $repos = @()
+# Чи це наше джерело: github gennadijkhimij/gmdi-token-meter або git-адреса цього репозиторію.
+function Test-OurSource($source) {
+  if (-not $source) { return $false }
+  if ($source.source -eq 'github') { return ([string]$source.repo) -eq $Repo }
+  if ($source.source -in @('git', 'url')) { return ([string]$source.url) -match '^(https://|git@)github\.com[:/]gennadijkhimij/gmdi-token-meter(\.git)?/?$' }
+  return $false
+}
+
+# Звідки маркетплейс gmdi в акаунті: 'ours', 'foreign', 'none' (запису немає) або 'unknown' (не читається).
+function Get-MarketOrigin([string]$dir, $settings) {
+  $sources = @()
   if ($settings -and $settings.PSObject.Properties['extraKnownMarketplaces'] -and $settings.extraKnownMarketplaces -and $settings.extraKnownMarketplaces.PSObject.Properties[$Market]) {
-    $repos += [string]$settings.extraKnownMarketplaces.$Market.source.repo
+    $sources += , $settings.extraKnownMarketplaces.$Market.source
   }
   $known = Join-Path $dir 'plugins\known_marketplaces.json'
   if (Test-Path -LiteralPath $known) {
-    try { $k = [IO.File]::ReadAllText($known, $utf8) | ConvertFrom-Json } catch { return '?' }
-    if ($k.PSObject.Properties[$Market]) { $repos += [string]$k.$Market.source.repo }
+    try { $k = [IO.File]::ReadAllText($known, $utf8) | ConvertFrom-Json } catch { return 'unknown' }
+    if ($k -and $k.PSObject.Properties[$Market]) { $sources += , $k.$Market.source }
   }
-  $other = @($repos | Where-Object { $_ -ne $Repo })
-  if ($other) { return $other[0] }
-  if ($repos) { return $Repo }
-  return ''
+  if ($sources.Count -eq 0) { return 'none' }
+  foreach ($src in $sources) { if (-not (Test-OurSource $src)) { return 'foreign' } }
+  return 'ours'
 }
 
 $failed = 0
@@ -84,18 +93,26 @@ foreach ($dir in $configDirs) {
     }
   }
 
-  $origin = Get-MarketRepo $dir $settings
-  if ($origin -and $origin -ne $Repo) {
-    Write-Host "[$label] пропущено: маркетплейс «$Market» тут веде на інше джерело ($origin) — це не наш мод." -ForegroundColor Yellow
+  $origin = Get-MarketOrigin $dir $settings
+  if ($origin -eq 'foreign') {
+    Write-Host "[$label] пропущено: маркетплейс «$Market» тут веде на інше джерело — це не наш мод." -ForegroundColor Yellow
     continue
+  }
+  if ($origin -eq 'unknown') {
+    Write-Host "[$label] пропущено: не читається plugins\known_marketplaces.json — джерело мода невідоме, нічого не змінено." -ForegroundColor Yellow
+    $failed++; continue
   }
   $state = Get-RegState $dir
   if ($state -eq 'error') {
     Write-Host "[$label] пропущено: не читається plugins\installed_plugins.json — стан мода невідомий, нічого не змінено." -ForegroundColor Yellow
     $failed++; continue
   }
+  if ($state -eq 'yes' -and $origin -eq 'none') {
+    Write-Host "[$label] пропущено: мод встановлено, але не з нашого маркетплейсу — джерело не підтверджено, нічого не змінено." -ForegroundColor Yellow
+    $failed++; continue
+  }
   $enabled = $settings -and $settings.PSObject.Properties['enabledPlugins'] -and $settings.enabledPlugins -and $settings.enabledPlugins.PSObject.Properties[$Key]
-  if ($state -eq 'no' -and -not $enabled -and $origin -ne $Repo) { Write-Host "[$label] мод не був підключений."; continue }
+  if ($state -eq 'no' -and -not $enabled -and $origin -ne 'ours') { Write-Host "[$label] мод не був підключений."; continue }
 
   # Резервна копія — до будь-яких змін, зокрема до uninstall рушієм (він сам змінює settings.json).
   $backup = $null
@@ -133,7 +150,7 @@ foreach ($dir in $configDirs) {
       if ($cur.PSObject.Properties['enabledPlugins'] -and $cur.enabledPlugins -and $cur.enabledPlugins.PSObject.Properties[$Key]) {
         $cur.enabledPlugins.PSObject.Properties.Remove($Key); $changed = $true
       }
-      if ($cur.PSObject.Properties['extraKnownMarketplaces'] -and $cur.extraKnownMarketplaces -and $cur.extraKnownMarketplaces.PSObject.Properties[$Market] -and ([string]$cur.extraKnownMarketplaces.$Market.source.repo) -eq $Repo) {
+      if ($cur.PSObject.Properties['extraKnownMarketplaces'] -and $cur.extraKnownMarketplaces -and $cur.extraKnownMarketplaces.PSObject.Properties[$Market] -and (Test-OurSource $cur.extraKnownMarketplaces.$Market.source)) {
         $cur.extraKnownMarketplaces.PSObject.Properties.Remove($Market); $changed = $true
       }
       if ($changed) { [IO.File]::WriteAllText($path, ($cur | ConvertTo-Json -Depth 100), $utf8) }

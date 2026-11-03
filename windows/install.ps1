@@ -88,6 +88,23 @@ function Get-InstalledVersion([string]$dir) {
   if ($v) { $v[0] } else { '?' }
 }
 
+# Версія мода в локальній копії маркетплейсу gmdi (після marketplace add/update — остання з GitHub).
+function Get-MarketVersion([string]$dir) {
+  try {
+    $k = [IO.File]::ReadAllText((Join-Path $dir 'plugins\known_marketplaces.json'), $utf8) | ConvertFrom-Json
+    $m = [IO.File]::ReadAllText((Join-Path $k.$Market.installLocation '.claude-plugin\plugin.json'), $utf8) | ConvertFrom-Json
+    return [string]$m.version
+  } catch { return $null }
+}
+
+# Чи це наше джерело: github gennadijkhimij/gmdi-token-meter або git-адреса цього репозиторію.
+function Test-OurSource($source) {
+  if (-not $source) { return $false }
+  if ($source.source -eq 'github') { return ([string]$source.repo) -eq $Repo }
+  if ($source.source -in @('git', 'url')) { return ([string]$source.url) -match '^(https://|git@)github\.com[:/]gennadijkhimij/gmdi-token-meter(\.git)?/?$' }
+  return $false
+}
+
 # Команда рушія без винятків від stderr (PowerShell 5.1); повертає код завершення і вивід.
 function Invoke-Engine([string]$dir, [string[]]$arguments) {
   $savedConfig = $env:CLAUDE_CONFIG_DIR
@@ -158,7 +175,7 @@ foreach ($a in $accounts) {
   if ($dev) { Say "[$label] пропущено: мод підключено з робочої копії $($dev[0])" Yellow; continue }
 
   $known = if ($s.PSObject.Properties['extraKnownMarketplaces'] -and $s.extraKnownMarketplaces) { $s.extraKnownMarketplaces.PSObject.Properties[$Market] } else { $null }
-  if ($known -and $known.Value.source -and ([string]$known.Value.source.repo) -ne $Repo) {
+  if ($known -and $known.Value.source -and -not (Test-OurSource $known.Value.source)) {
     Write-Host "[$label] пропущено: маркетплейс «$Market» уже веде на інше джерело. Встановіть вручну: /plugin install $Plugin --marketplace $Repo" -ForegroundColor Yellow
     continue
   }
@@ -185,14 +202,14 @@ foreach ($a in $accounts) {
 
     # 3. Встановити рушієм і переконатися, що мод на місці.
     $why = $null
-    if ((Test-Installed $a.Dir) -and $engine) {
-      # Уже встановлено: підтягнути останню версію з GitHub (невдача тут не скасовує решту).
-      $null = Invoke-Engine $a.Dir @('plugin', 'marketplace', 'update', $Market)
+    if (-not $engine) { throw 'не знайдено застосунок Claude (claude.exe)' }
+    if (Test-Installed $a.Dir) {
+      # Уже встановлено: підтягнути останню версію з GitHub; невдача скасовує все для акаунта.
+      $r = Invoke-Engine $a.Dir @('plugin', 'marketplace', 'update', $Market)
+      if ($r.Code -ne 0) { throw "plugin marketplace update: $($r.Out)" }
       $r = Invoke-Engine $a.Dir @('plugin', 'update', $Key, '--scope', 'user')
-      if ($r.Code -ne 0) { Write-Host "[$label] не вдалося оновити: $($r.Out)" -ForegroundColor Yellow }
-    }
-    if (-not (Test-Installed $a.Dir)) {
-      if (-not $engine) { throw 'не знайдено застосунок Claude (claude.exe)' }
+      if ($r.Code -ne 0) { throw "plugin update: $($r.Out)" }
+    } else {
       $r = Invoke-Engine $a.Dir @('plugin', 'marketplace', 'add', $Repo)
       if ($r.Code -ne 0) { $why = "plugin marketplace add: $($r.Out)" }
       $r = Invoke-Engine $a.Dir @('plugin', 'install', $Key, '--scope', 'user')
@@ -202,6 +219,10 @@ foreach ($a in $accounts) {
       if (-not $why) { $why = 'після встановлення мода немає в реєстрі Claude' }
       throw $why
     }
+    # Встановлена версія має дорівнювати версії в щойно оновленому маркетплейсі.
+    $latest = Get-MarketVersion $a.Dir
+    $have = Get-InstalledVersion $a.Dir
+    if (-not $latest -or $have -ne $latest) { throw "встановлено версію $have, а в маркетплейсі — $(if ($latest) { $latest } else { 'невідомо' })" }
 
     # 4. Новий мод на місці. `plugin marketplace add` переписує settings.json і буває губить autoUpdate:
     #    перечитати файл, повернути autoUpdate і прибрати стару копію з env.
