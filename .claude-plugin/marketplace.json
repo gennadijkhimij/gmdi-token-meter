@@ -1,0 +1,12 @@
+{
+  "name": "gmdi",
+  "owner": { "name": "Gennadij Khimij", "url": "https://github.com/gennadijkhimij" },
+  "metadata": { "description": "Mods for Claude Code by Gennadij Khimij (GMDI)." },
+  "plugins": [
+    {
+      "name": "gmdi-token-meter",
+      "source": "./",
+      "description": "Usage band above the Claude Code prompt: 7D/5H limits, prompt-cache warm/cold timer, cost to resume, cache warmer."
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "gmdi-token-meter",
+  "version": "0.2.0",
+  "description": "Смуга над полем вводу: ліміти 7D/5H, тепло/холод кешу з таймером, ціна продовження після простою; прогрівач кешу (за 5 хв до охолодження сам надсилає короткий запит, до 4 разів поспіль); деталі й налаштування (мова uk/en, які блоки показувати).",
+  "author": { "name": "Gennadij Khimij", "url": "https://github.com/gennadijkhimij" },
+  "homepage": "https://github.com/gennadijkhimij/gmdi-token-meter",
+  "repository": "https://github.com/gennadijkhimij/gmdi-token-meter",
+  "license": "Apache-2.0",
+  "keywords": ["usage", "rate-limits", "prompt-cache", "cost", "band"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "cache_ttl": {
+      "type": "string",
+      "title": "TTL кешу запитів",
+      "description": "Скільки живе кеш запитів: 1h — підписка Pro/Max у межах плану, 5m — API-ключ чи кредити. Вхід API-ключем мод бачить сам і бере 5m; вибір у ⚙ на смузі важливіший за обидва.",
+      "default": "1h",
+      "options": ["1h", "5m"]
+    }
+  }
+}
