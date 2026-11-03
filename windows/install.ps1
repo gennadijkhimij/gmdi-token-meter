@@ -105,6 +105,22 @@ function Test-OurSource($source) {
   return $false
 }
 
+# Звідки маркетплейс gmdi в акаунті: 'ours', 'foreign', 'none' (запису немає) або 'unknown' (не читається).
+function Get-MarketOrigin([string]$dir, $settings) {
+  $sources = @()
+  if ($settings -and $settings.PSObject.Properties['extraKnownMarketplaces'] -and $settings.extraKnownMarketplaces -and $settings.extraKnownMarketplaces.PSObject.Properties[$Market]) {
+    $sources += , $settings.extraKnownMarketplaces.$Market.source
+  }
+  $known = Join-Path $dir 'plugins\known_marketplaces.json'
+  if (Test-Path -LiteralPath $known) {
+    try { $k = [IO.File]::ReadAllText($known, $utf8) | ConvertFrom-Json } catch { return 'unknown' }
+    if ($k -and $k.PSObject.Properties[$Market]) { $sources += , $k.$Market.source }
+  }
+  if ($sources.Count -eq 0) { return 'none' }
+  foreach ($src in $sources) { if (-not (Test-OurSource $src)) { return 'foreign' } }
+  return 'ours'
+}
+
 # Команда рушія без винятків від stderr (PowerShell 5.1); повертає код завершення і вивід.
 function Invoke-Engine([string]$dir, [string[]]$arguments) {
   $savedConfig = $env:CLAUDE_CONFIG_DIR
@@ -175,8 +191,14 @@ foreach ($a in $accounts) {
   if ($dev) { Say "[$label] пропущено: мод підключено з робочої копії $($dev[0])" Yellow; continue }
 
   $known = if ($s.PSObject.Properties['extraKnownMarketplaces'] -and $s.extraKnownMarketplaces) { $s.extraKnownMarketplaces.PSObject.Properties[$Market] } else { $null }
-  if ($known -and $known.Value.source -and -not (Test-OurSource $known.Value.source)) {
+  $origin = Get-MarketOrigin $a.Dir $s
+  if ($origin -eq 'foreign') {
     Write-Host "[$label] пропущено: маркетплейс «$Market» уже веде на інше джерело. Встановіть вручну: /plugin install $Plugin --marketplace $Repo" -ForegroundColor Yellow
+    continue
+  }
+  if ($origin -eq 'unknown') {
+    Write-Host "[$label] пропущено: не читається plugins\known_marketplaces.json — нічого не змінено." -ForegroundColor Yellow
+    $failed++
     continue
   }
 
@@ -210,10 +232,13 @@ foreach ($a in $accounts) {
       $r = Invoke-Engine $a.Dir @('plugin', 'update', $Key, '--scope', 'user')
       if ($r.Code -ne 0) { throw "plugin update: $($r.Out)" }
     } else {
-      $r = Invoke-Engine $a.Dir @('plugin', 'marketplace', 'add', $Repo)
-      if ($r.Code -ne 0) { $why = "plugin marketplace add: $($r.Out)" }
+      # add може не спрацювати, якщо маркетплейс уже відомий; тоді його свіжість підтверджує update.
+      $null = Invoke-Engine $a.Dir @('plugin', 'marketplace', 'add', $Repo)
+      $r = Invoke-Engine $a.Dir @('plugin', 'marketplace', 'update', $Market)
+      if ($r.Code -ne 0) { throw "plugin marketplace update: $($r.Out)" }
+      if ((Get-MarketOrigin $a.Dir $null) -ne 'ours') { throw "маркетплейс «$Market» після додавання веде не на $Repo" }
       $r = Invoke-Engine $a.Dir @('plugin', 'install', $Key, '--scope', 'user')
-      if ($r.Code -ne 0) { $why = "plugin install: $($r.Out)" }
+      if ($r.Code -ne 0) { throw "plugin install: $($r.Out)" }
     }
     if (-not (Test-Installed $a.Dir)) {
       if (-not $why) { $why = 'після встановлення мода немає в реєстрі Claude' }
@@ -270,6 +295,6 @@ if (Test-Path -LiteralPath $OldCopy) {
 
 if ($Quiet) { return }
 Write-Host ''
-if ($failed) { Write-Host "Не встановлено в акаунтах: $failed. Причина — вище; повторіть, коли буде доступ до github.com." -ForegroundColor Yellow; exit 2 }
+if ($failed) { Write-Host "Не встановлено в акаунтах: $failed. Причина — вище; виправте її й запустіть ще раз." -ForegroundColor Yellow; exit 2 }
 Write-Host 'Готово. Закрийте й знову відкрийте застосунок Claude: смуга з''явиться над полем вводу.'
 Write-Host 'Далі Claude перевірятиме оновлення під час кожного запуску й ставитиме їх сам.'
