@@ -1,6 +1,6 @@
 {
   "name": "gmdi-token-meter",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Смуга над полем вводу: ліміти 7D/5H, тепло/холод кешу з таймером, ціна продовження після простою; прогрівач кешу (за 5 хв до охолодження сам надсилає короткий запит, до 4 разів поспіль); деталі й налаштування (мова uk/en, які блоки показувати).",
   "author": { "name": "Gennadij Khimij", "url": "https://github.com/gennadijkhimij" },
   "homepage": "https://github.com/gennadijkhimij/gmdi-token-meter",

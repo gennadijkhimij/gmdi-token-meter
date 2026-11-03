@@ -82,6 +82,12 @@ function Test-Installed([string]$dir) {
   return $false
 }
 
+function Get-InstalledVersion([string]$dir) {
+  try { $reg = [IO.File]::ReadAllText((Join-Path $dir 'plugins\installed_plugins.json'), $utf8) | ConvertFrom-Json } catch { return '?' }
+  $v = @($reg.plugins.$Key | Where-Object { $_.scope -eq 'user' } | ForEach-Object { $_.version })
+  if ($v) { $v[0] } else { '?' }
+}
+
 # Команда рушія без винятків від stderr (PowerShell 5.1); повертає код завершення і вивід.
 function Invoke-Engine([string]$dir, [string[]]$arguments) {
   $savedConfig = $env:CLAUDE_CONFIG_DIR
@@ -143,6 +149,8 @@ foreach ($a in $accounts) {
   $markerPath = Join-Path $a.Dir $Marker
 
   if ($Quiet -and (Test-Path -LiteralPath $markerPath)) { continue }
+  # Мод, вимкнений у Claude (enabledPlugins = false), фоновий запуск не вмикає.
+  if ($Quiet -and $s.PSObject.Properties['enabledPlugins'] -and $s.enabledPlugins -and $s.enabledPlugins.PSObject.Properties[$Key] -and $s.enabledPlugins.$Key -eq $false) { continue }
 
   $entries = Get-PluginDirs $s
   $same = @($entries | Where-Object { (Split-Path $_.TrimEnd('\', '/') -Leaf) -eq $Plugin })
@@ -177,6 +185,12 @@ foreach ($a in $accounts) {
 
     # 3. Встановити рушієм і переконатися, що мод на місці.
     $why = $null
+    if ((Test-Installed $a.Dir) -and $engine) {
+      # Уже встановлено: підтягнути останню версію з GitHub (невдача тут не скасовує решту).
+      $null = Invoke-Engine $a.Dir @('plugin', 'marketplace', 'update', $Market)
+      $r = Invoke-Engine $a.Dir @('plugin', 'update', $Key, '--scope', 'user')
+      if ($r.Code -ne 0) { Write-Host "[$label] не вдалося оновити: $($r.Out)" -ForegroundColor Yellow }
+    }
     if (-not (Test-Installed $a.Dir)) {
       if (-not $engine) { throw 'не знайдено застосунок Claude (claude.exe)' }
       $r = Invoke-Engine $a.Dir @('plugin', 'marketplace', 'add', $Repo)
@@ -214,7 +228,7 @@ foreach ($a in $accounts) {
 
   [IO.File]::WriteAllText($markerPath, "$stamp $Repo`n", $utf8)
   if ($backup -and $a.Raw -eq [IO.File]::ReadAllText($a.Path, $utf8)) { Remove-Item -LiteralPath $backup -Force }
-  Write-Host "[$label] мод встановлено, автооновлення ввімкнено." -ForegroundColor Green
+  Write-Host "[$label] мод встановлено (версія $(Get-InstalledVersion $a.Dir)), автооновлення ввімкнено." -ForegroundColor Green
 }
 
 # 5. Стара копія з архіву-інсталятора: видалити, якщо на неї не посилається жоден акаунт ПК.
