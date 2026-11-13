@@ -7,6 +7,7 @@ const BAND = {
   component: 'AbovePrompt',
   props: {
     hasSurvey: false,
+    isCollapsed: false,
     isWorking: false,
     maxRows: 10,
     bodyColumns: 120,
@@ -660,4 +661,234 @@ test('a warmer turned off in another session stays off here, and its details say
   const details = await $.ui.mount({ ...BAND, surface: 'desktop' })
   expect((await details.find({ type: 'Text', text: /^вимкнено/ }))?.text).toBe('вимкнено · увімкнути в ⚙')
   expect(await details.find({ key: 'warm-pause' })).toBeUndefined()
+})
+
+// ---- Warnings: limit windows and paid usage, for every kind of sign-in ----
+
+// The usage endpoint as a subscription reads it: extra usage in cents.
+const usageEndpoint = (on: On, extraUsage: Record<string, unknown> | null, calls: string[] = []) => {
+  on('session.authorize', () => ({ value: { handle: 'h', kind: 'bearer' as const } }))
+  on('http.fetch', (_, e) => {
+    calls.push(`${e.url} auth=${e.init?.auth ?? ''}`)
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ five_hour: null, extra_usage: extraUsage }) } }
+  })
+}
+
+const toastsOf = (on: On) => {
+  const toasts: string[] = []
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  return toasts
+}
+
+// The week of 29.10 12:00 UTC began on 25.10 12:00 (4 days in), resets on 01.11 12:00.
+const WEEK_84 = [
+  { kind: 'seven_day', percentUsed: 84, resetsAt: new Date(NOW + 3 * 24 * 3_600_000).toISOString() },
+  { kind: 'five_hour', percentUsed: 20, resetsAt: new Date(NOW + 4 * 3_600_000).toISOString() },
+]
+
+test('a subscription with extra usage on: the band shows what is paid of the cap, the details its steps, one toast per step', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  storeIn(on, saved)
+  session(on, { tokens: 100_000, limits: WEEK_84 })
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  const calls: string[] = []
+  usageEndpoint(on, { is_enabled: true, monthly_limit: 15_000, used_credits: 5_200, utilization: 34.7, currency: 'USD' }, calls)
+  const toasts = toastsOf(on)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(calls).toEqual(['https://api.anthropic.com/api/oauth/usage auth=h'])
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop', props: { ...BAND.props, bodyColumns: 160 } })
+  expect((await ui.find({ type: 'Text', text: /^доплати / }))?.text).toBe('доплати $52/$150')
+  // 84 % of the week is past the 80 % step: the meter carries the mark.
+  expect((await ui.find({ type: 'Text', text: /^⚠$/ }))?.text).toBe('⚠')
+  await ui.unmount()
+  // At 120 columns the word goes first, the sum stays.
+  const narrow = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await narrow.find({ type: 'Text', text: /^\$52/ }))?.text).toBe('$52/$150')
+  await narrow.press({ key: 'toggle' })
+  await narrow.unmount()
+
+  const details = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await details.find({ type: 'Text', text: /^Доплати$/ }))?.text).toBe('Доплати')
+  expect((await details.find({ type: 'Text', text: /^\$52 з / }))?.text).toBe(
+    '$52 з $150 (35%) · стеля організації · попередження $50/$100/$140 · за розрахунковий місяць',
+  )
+  await details.unmount()
+
+  // The week at 84 %, four days of seven in: 21 %/day, so it runs out in about 0.76 day.
+  expect(toasts).toHaveLength(2)
+  expect(toasts[0]).toMatch(/^⚠ Тиждень: використано 84% · за поточного темпу закінчиться ≈.+ · скидання .+$/)
+  expect(toasts[1]).toBe('💲 Доплати: $52 з $150 (35%) за місяць')
+
+  // Nothing new: the timer and another measure stay quiet; the endpoint is read again after 5 minutes.
+  await clock.advance(6 * 60_000)
+  await $.session.measure({ context: { tokens: 100_000, window: 1_000_000 }, rateLimits: WEEK_84, changed: ['rateLimits'] })
+  expect(toasts).toHaveLength(2)
+  expect(calls).toHaveLength(2)
+
+  // A reload (another session.start) reads the store: still quiet.
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(toasts).toHaveLength(2)
+})
+
+test('the week past 95 % with extra usage off says that work stops; the details say extra usage is off', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  const limits = [{ kind: 'seven_day', percentUsed: 96, resetsAt: new Date(NOW + 3 * 24 * 3_600_000).toISOString() }]
+  session(on, { tokens: 100_000, limits })
+  usageEndpoint(on, { is_enabled: false, monthly_limit: null, used_credits: null, utilization: null, currency: 'USD' })
+  const toasts = toastsOf(on)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(toasts).toHaveLength(1)
+  expect(toasts[0]).toMatch(/^⚠ Тиждень: використано 96% · .* · далі робота зупиниться до скидання \(доплати вимкнено\)$/)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /^доплати / })).toBeUndefined()
+  await ui.press({ key: 'toggle' })
+  await ui.unmount()
+  const details = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await details.find({ type: 'Text', text: /^вимкнено · після/ }))?.text).toBe('вимкнено · після вичерпання ліміту робота зупиниться до скидання')
+  await details.unmount()
+})
+
+test('a budget in ⚙ below the organization cap is the cap the band warns against; reaching it says charges go on', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on, { 'money.budget': 100 })
+  session(on, { tokens: 100_000, limits: [] })
+  usageEndpoint(on, { is_enabled: true, monthly_limit: 20_000, used_credits: 10_300, utilization: 51.5, currency: 'USD' })
+  const toasts = toastsOf(on)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(toasts).toEqual(['💲 Ваш бюджет доплат $100 вичерпано (стеля організації вища — гроші й далі списуються)'])
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /^доплати / }))?.text).toBe('доплати $103/$100')
+  await ui.press({ key: 'toggle' })
+  await ui.unmount()
+  const details = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await details.find({ type: 'Text', text: /^\$103 з / }))?.text).toBe(
+    '$103 з $100 (103%) · стеля ваша (⚙) · попередження $33/$67/$93 · за розрахунковий місяць',
+  )
+  await details.unmount()
+})
+
+test('an API key counts its own month from the session cost and warns at the shares of the budget', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = { 'money.budget': 50, 'spend.2026-10': 10 }
+  storeIn(on, saved)
+  let cost = 2
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('session.usage', () => ({ value: { startedAt: NOW, context: { tokens: 50_000, window: 1_000_000 }, rateLimits: [], cost: { usd: cost } } }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('session.authorize', () => ({ value: { handle: 'h', kind: 'api-key' as const } }))
+  const fetched: string[] = []
+  on('http.fetch', (_, e) => {
+    fetched.push(e.url)
+    return { value: { status: 500, ok: false, headers: {}, text: '' } }
+  })
+  const toasts = toastsOf(on)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  // An API key has no usage endpoint to read; $10 of $50 is under a third.
+  expect(fetched).toEqual([])
+  expect(toasts).toEqual([])
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /^доплати / }))?.text).toBe('доплати $10/$50')
+
+  // The session spends $8 more: $18 of $50 passes the first third.
+  cost = 10
+  await $.session.measure({ context: { tokens: 50_000, window: 1_000_000 }, rateLimits: [], cost: { usd: cost }, changed: ['cost'] })
+  expect(saved['spend.2026-10']).toBe(18)
+  expect((await ui.find({ type: 'Text', text: /^доплати / }))?.text).toBe('доплати $18/$50')
+  expect(toasts).toEqual(['💲 Доплати: $18 з $50 (36%) за місяць'])
+  await ui.unmount()
+})
+
+test('a gateway spend limit gets a meter and a warning of its own; warnings off in ⚙ keep everything quiet', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  storeIn(on, saved)
+  const limits = [{ kind: 'spend_limit', percentUsed: 82, resetsAt: new Date(NOW + 10 * 24 * 3_600_000).toISOString() }]
+  session(on, { tokens: 50_000, limits })
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('session.authorize', () => ({ value: null }))
+  const toasts = toastsOf(on)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(toasts).toHaveLength(1)
+  expect(toasts[0]).toMatch(/^⚠ Ліміт витрат: використано 82%$/)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /^Ліміт витрат$/ }))?.text).toBe('Ліміт витрат')
+  expect((await ui.find({ type: 'Text', text: /^18% вільно$/ }))?.text).toBe('18% вільно')
+
+  // ⚙ → «Попереджати з: вимк»: no mark, and a higher reading stays quiet.
+  await ui.press({ key: 'toggle' })
+  await ui.unmount()
+  const details = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await details.press({ key: 'open-settings' })
+  await details.unmount()
+  const settingsView = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await settingsView.press({ key: 'warn-0' })
+  await settingsView.unmount()
+  expect(saved['warn.at']).toBe(0)
+  const quiet = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await quiet.find({ type: 'Text', text: /^⚠$/ })).toBeUndefined()
+  await quiet.unmount()
+  await $.session.measure({
+    context: { tokens: 50_000, window: 1_000_000 },
+    rateLimits: [{ kind: 'spend_limit', percentUsed: 97, resetsAt: limits[0]!.resetsAt }],
+    changed: ['rateLimits'],
+  })
+  expect(toasts).toHaveLength(1)
+})
+
+test('the sessions share one usage reading, and a 429 waits for its Retry-After', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // Another session read the endpoint two minutes ago: its reading is used, nothing is fetched.
+  const saved: Record<string, unknown> = {
+    'usage.shared': {
+      extra: { enabled: true, limit: 150, used: 12, currency: 'USD', at: NOW - 2 * 60_000 },
+      next: NOW + 3 * 60_000,
+    },
+  }
+  storeIn(on, saved)
+  session(on, { tokens: 50_000, limits: [] })
+  let status = 429
+  const calls: number[] = []
+  on('session.authorize', () => ({ value: { handle: 'h', kind: 'bearer' as const } }))
+  on('http.fetch', () => {
+    calls.push(calls.length + 1)
+    const headers: Record<string, string> = status === 429 ? { 'retry-after': '600' } : {}
+    return status === 429
+      ? { value: { status, ok: false, headers, text: '{"error":{"type":"rate_limit_error"}}' } }
+      : { value: { status, ok: true, headers, text: JSON.stringify({ extra_usage: { is_enabled: true, monthly_limit: 15_000, used_credits: 2_000, currency: 'USD' } }) } }
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(calls).toEqual([])
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /^доплати / }))?.text).toBe('доплати $12/$150')
+
+  // Past `next` this session reads, gets a 429 and leaves the next read 10 minutes away for everyone.
+  await clock.advance(4 * 60_000)
+  expect(calls).toHaveLength(1)
+  // Read at the first tick past `next` (3 minutes in), so the next one is 10 minutes after that.
+  expect((saved['usage.shared'] as { next: number }).next).toBe(NOW + 3 * 60_000 + 600_000)
+  await clock.advance(8 * 60_000)
+  expect(calls).toHaveLength(1)
+
+  status = 200
+  await clock.advance(2 * 60_000)
+  expect(calls).toHaveLength(2)
+  expect((await ui.find({ type: 'Text', text: /^доплати / }))?.text).toBe('доплати $20/$150')
+  expect((saved['usage.shared'] as { extra: { used: number } }).extra.used).toBe(20)
+  await ui.unmount()
 })

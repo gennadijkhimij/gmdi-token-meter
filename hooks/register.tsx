@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren, SessionContextUsage, SessionCost, SessionRateLimit } from 'claude-code'
 
-import type { Blocks, Context, Lang, Limit, Settings, View, Warm, WarmMax } from '../types'
+import type { Blocks, Budget, Context, Extra, Lang, Limit, Plan, Settings, View, Warm, WarmMax, WarnAt } from '../types'
 import { LANG_NAMES, TEXT } from './i18n'
 import type { Strings } from './i18n'
 
@@ -19,6 +19,12 @@ const view = atom({ plugin: 'gmdi-token-meter', key: 'view' } as const, 'closed'
 // Bumped by a timer so the countdowns redraw while the session is idle.
 const tick = atom({ plugin: 'gmdi-token-meter', key: 'tick' } as const, 0)
 const warm = atom({ plugin: 'gmdi-token-meter', key: 'warm' } as const, { paused: false, done: 0, lastAt: null } as Warm)
+// How the session is signed in, which says where paid usage is read from.
+const plan = atom({ plugin: 'gmdi-token-meter', key: 'plan' } as const, 'unknown' as Plan)
+// A subscription's extra usage from the usage endpoint; null until read, or where there is none.
+const extra = atom({ plugin: 'gmdi-token-meter', key: 'extra' } as const, null as Extra | null)
+// An API key's spend this month on this computer, as the mod has counted it.
+const spend = atom({ plugin: 'gmdi-token-meter', key: 'spend' } as const, null as number | null)
 
 // A details fact: colored, plain (strong) or dim.
 type Fact = { text: string; color?: string; strong?: boolean }
@@ -27,7 +33,7 @@ type Fact = { text: string; color?: string; strong?: boolean }
 // change in one session never overwrites what another session changed. The one
 // object under 'settings' is how 0.1 kept them: read as the base, never written.
 const LEGACY_KEY = 'settings'
-type SettingKey = 'lang' | 'ttl' | 'warm.max' | `show.${keyof Blocks}`
+type SettingKey = 'lang' | 'ttl' | 'warm.max' | 'warn.at' | 'money.budget' | `show.${keyof Blocks}`
 const DOTS = 10
 const DIM = '#5b5b5b'
 // The details' label column, in cells: fits «Тиждень» / «Session» and a gap.
@@ -36,7 +42,7 @@ const WINDOWS: Record<string, { strings: 'week' | 'fiveHour'; ms: number }> = {
   seven_day: { strings: 'week', ms: 7 * 24 * 3_600_000 },
   five_hour: { strings: 'fiveHour', ms: 5 * 3_600_000 },
 }
-const BAND_BLOCKS: readonly (keyof Blocks)[] = ['label', 'week', 'fiveHour', 'reset', 'words', 'cache', 'price']
+const BAND_BLOCKS: readonly (keyof Blocks)[] = ['label', 'week', 'fiveHour', 'reset', 'words', 'cache', 'price', 'money']
 const DETAIL_BLOCKS: readonly (keyof Blocks)[] = ['forecast', 'priceDetails', 'models', 'session']
 
 // The warmer: a short prompt a few minutes before the cache would cool reads the whole
@@ -47,11 +53,24 @@ const WARM_MIN_TOKENS = 20_000
 // Below these shares left the warmer stands down: the plan's limits matter more than the cache.
 const WARM_FLOOR: Record<string, number> = { five_hour: 10, seven_day: 5 }
 
+// Warnings. A limit window warns from the share picked in ⚙ and again at CRITICAL;
+// paid usage warns once it starts, at a third, two thirds and 14/15 of its cap
+// ($50 / $100 / $140 of $150) and at the cap. Each step is told once, in one session.
+const WARN_CHOICES: readonly WarnAt[] = [0, 70, 80, 90]
+const BUDGET_CHOICES: readonly Budget[] = [0, 50, 100, 150, 200, 500]
+const CRITICAL = 95
+const MONEY_SHARES: readonly number[] = [1 / 3, 2 / 3, 14 / 15]
+// The endpoint Claude Code's own /usage reads: a subscription's windows and its extra usage.
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+const USAGE_EVERY = 5 * 60_000
+
 const defaults = (ttl: '1h' | '5m'): Settings => ({
   lang: 'uk',
   ttl,
   warmMax: 4,
-  show: { label: true, week: true, fiveHour: true, reset: true, words: true, cache: true, price: true, forecast: true, priceDetails: true, models: true, session: true },
+  warnAt: 80,
+  budget: 0,
+  show: { label: true, week: true, fiveHour: true, reset: true, words: true, cache: true, price: true, money: true, forecast: true, priceDetails: true, models: true, session: true },
 })
 
 // A stored value may come from an older version or be damaged: every field is
@@ -59,7 +78,7 @@ const defaults = (ttl: '1h' | '5m'): Settings => ({
 const withDefaults = (stored: unknown, ttl: '1h' | '5m'): Settings => {
   const base = defaults(ttl)
   if (!stored || typeof stored !== 'object') return base
-  const s = stored as { lang?: unknown; ttl?: unknown; warmMax?: unknown; show?: unknown }
+  const s = stored as { lang?: unknown; ttl?: unknown; warmMax?: unknown; warnAt?: unknown; budget?: unknown; show?: unknown }
   const shown = s.show && typeof s.show === 'object' ? (s.show as Record<string, unknown>) : {}
   const show = { ...base.show }
   for (const key of Object.keys(show) as (keyof Blocks)[]) {
@@ -70,6 +89,8 @@ const withDefaults = (stored: unknown, ttl: '1h' | '5m'): Settings => {
     lang: s.lang === 'en' || s.lang === 'uk' ? s.lang : base.lang,
     ttl: s.ttl === '5m' || s.ttl === '1h' ? s.ttl : base.ttl,
     warmMax: WARM_CHOICES.find(n => n === s.warmMax) ?? base.warmMax,
+    warnAt: WARN_CHOICES.find(n => n === s.warnAt) ?? base.warnAt,
+    budget: BUDGET_CHOICES.find(n => n === s.budget) ?? base.budget,
     show,
   }
 }
@@ -191,7 +212,17 @@ const save = async (
 }
 
 const valueOf = (s: Settings, key: SettingKey): unknown =>
-  key === 'lang' ? s.lang : key === 'ttl' ? s.ttl : key === 'warm.max' ? s.warmMax : s.show[key.slice('show.'.length) as keyof Blocks]
+  key === 'lang'
+    ? s.lang
+    : key === 'ttl'
+      ? s.ttl
+      : key === 'warm.max'
+        ? s.warmMax
+        : key === 'warn.at'
+          ? s.warnAt
+          : key === 'money.budget'
+            ? s.budget
+            : s.show[key.slice('show.'.length) as keyof Blocks]
 
 const why = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
@@ -201,13 +232,15 @@ async function loadSettings($: EngineInterface, ttl: '1h' | '5m'): Promise<Setti
   try {
     const keys = new Set(await $.store.keys())
     const legacy = keys.has(LEGACY_KEY) ? await $.store.get(LEGACY_KEY) : undefined
-    const raw: { lang?: unknown; ttl?: unknown; warmMax?: unknown; show: Record<string, unknown> } = {
+    const raw: { lang?: unknown; ttl?: unknown; warmMax?: unknown; warnAt?: unknown; budget?: unknown; show: Record<string, unknown> } = {
       ...(legacy && typeof legacy === 'object' ? (legacy as object) : {}),
       show: { ...((legacy as { show?: object } | undefined)?.show ?? {}) },
     }
     if (keys.has('lang')) raw.lang = await $.store.get('lang')
     if (keys.has('ttl')) raw.ttl = await $.store.get('ttl')
     if (keys.has('warm.max')) raw.warmMax = await $.store.get('warm.max')
+    if (keys.has('warn.at')) raw.warnAt = await $.store.get('warn.at')
+    if (keys.has('money.budget')) raw.budget = await $.store.get('money.budget')
     for (const block of Object.keys(defaults(ttl).show)) {
       if (keys.has(`show.${block}`)) raw.show[block] = await $.store.get(`show.${block}`)
     }
@@ -296,22 +329,247 @@ async function maybeWarm($: EngineInterface) {
   }
 }
 
-// The timer's work: a fresh model, a redraw for the countdowns, and the warmer.
+// The timer's work: a fresh model, a redraw for the countdowns, the warmer and paid usage.
 async function onTick($: EngineInterface) {
   await refreshModel($)
   await update($, tick, n => n + 1)
   await maybeWarm($)
+  await refreshExtra($)
+  await checkWarnings($)
+}
+
+// How the session is signed in: a subscription token, an API key, or neither (a gateway,
+// Bedrock, Vertex); the engine refusing to tell is 'unknown'.
+async function detectPlan($: EngineInterface): Promise<Plan> {
+  try {
+    const auth = await $.session.authorize()
+    return auth === null ? 'other' : auth.kind === 'api-key' ? 'api-key' : 'bearer'
+  } catch {
+    return 'unknown'
+  }
 }
 
 // The TTL the login gives: an API key caches for 5 minutes, a subscription for an hour.
-// No first-party login, or the engine refusing to tell, leaves the configured one.
-async function loginTtl($: EngineInterface, configured: '1h' | '5m'): Promise<'1h' | '5m'> {
-  if (configured === '5m') return '5m'
-  try {
-    return (await $.session.authorize())?.kind === 'api-key' ? '5m' : configured
-  } catch {
-    return configured
+const loginTtl = (p: Plan, configured: '1h' | '5m'): '1h' | '5m' => (p === 'api-key' ? '5m' : configured)
+
+// Paid usage as the band shows it: a subscription's extra usage, or an API key's own spend.
+// `cap` is the stricter of the organization's monthly limit and the person's budget in ⚙.
+type Money = { source: 'extra' | 'api'; enabled: boolean; used: number; cap: number | null; own: boolean; currency: string }
+
+const moneyOf = (cfg: Settings, p: Plan, x: Extra | null, spent: number | null): Money | null => {
+  const own = cfg.budget > 0 ? cfg.budget : null
+  if (x) {
+    const cap = own !== null && (x.limit === null || own < x.limit) ? own : x.limit
+    return { source: 'extra', enabled: x.enabled, used: x.used ?? 0, cap, own: own !== null && cap === own && own !== x.limit, currency: x.currency }
   }
+  if (p === 'api-key' && spent !== null) return { source: 'api', enabled: true, used: spent, cap: own, own: true, currency: 'USD' }
+  return null
+}
+
+// 0 nothing paid, 1 started, 2–4 a share of the cap passed, 5 the cap reached.
+const moneyLevel = (m: Money): number => {
+  if (m.used <= 0) return 0
+  if (m.cap === null) return 1
+  const share = m.used / m.cap
+  if (share >= 1) return 5
+  return MONEY_SHARES.reduce((level, s, i) => (share >= s ? i + 2 : level), 1)
+}
+
+const money = (n: number, currency = 'USD'): string => {
+  const figure = n >= 100 || Number.isInteger(n) ? String(Math.round(n)) : n.toFixed(2)
+  return currency === 'USD' ? `$${figure}` : `${figure} ${currency}`
+}
+
+const moneySteps = (cap: number, currency: string): string => MONEY_SHARES.map(s => money(Math.round(cap * s), currency)).join('/')
+
+// 0 quiet, 1 past the share picked in ⚙, 2 past CRITICAL.
+const windowLevel = (warnAt: WarnAt, used: number): number => (warnAt === 0 ? 0 : used >= CRITICAL ? 2 : used >= warnAt ? 1 : 0)
+
+// The usage endpoint's extra usage, amounts in minor units (`decimal_places` of them, cents
+// by default), or null when it has none. A cap reached reads as the whole cap spent.
+const parseExtra = (text: string, now: number): Extra | null => {
+  const data = JSON.parse(text) as { extra_usage?: unknown }
+  const x = data?.extra_usage as Record<string, unknown> | null | undefined
+  if (!x || typeof x !== 'object') return null
+  const places = typeof x.decimal_places === 'number' && Number.isInteger(x.decimal_places) && x.decimal_places >= 0 && x.decimal_places <= 4 ? x.decimal_places : 2
+  const minor = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v / 10 ** places : null)
+  const currency = typeof x.currency === 'string' && /^[A-Za-z]{3}$/.test(x.currency) ? x.currency.toUpperCase() : 'USD'
+  const limit = minor(x.monthly_limit)
+  const used = x.spend_limit_reached === true && limit !== null ? Math.max(minor(x.used_credits) ?? 0, limit) : minor(x.used_credits)
+  return { enabled: x.is_enabled === true, limit, used, currency, at: now }
+}
+
+// Reads a subscription's extra usage at most every USAGE_EVERY. A failure (an old engine,
+// no network, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC) leaves the last reading.
+// A reading from the store: every field checked, anything else is no reading.
+const asExtra = (v: unknown): Extra | null => {
+  if (!v || typeof v !== 'object') return null
+  const x = v as Record<string, unknown>
+  const amount = (n: unknown) => (n === null || (typeof n === 'number' && Number.isFinite(n)) ? (n as number | null) : undefined)
+  const limit = amount(x.limit)
+  const used = amount(x.used)
+  if (typeof x.enabled !== 'boolean' || limit === undefined || used === undefined || typeof x.currency !== 'string' || typeof x.at !== 'number') return null
+  return { enabled: x.enabled, limit, used, currency: x.currency, at: x.at }
+}
+
+// Every open session runs the mod, and the endpoint (shared with the app's own usage card)
+// answers 429 to a caller that asks too often. So the sessions share one reading in the
+// store, 'usage.shared' = { extra, next }: the one that finds `next` passed claims the read
+// and fetches; the rest take its reading. A 429 waits for Retry-After, or twice the last
+// wait, up to USAGE_MAX_WAIT. Each session looks at the store at most once a minute.
+const USAGE_SHARED = 'usage.shared'
+const USAGE_MAX_WAIT = 30 * 60_000
+let usageReadAt = 0
+let usageWait = USAGE_EVERY
+async function refreshExtra($: EngineInterface) {
+  if ((await read($, plan)) !== 'bearer') return
+  const now = await $.clock.now()
+  if (now - usageReadAt < 60_000) return
+  usageReadAt = now
+
+  let shared: { extra?: unknown; next?: unknown } = {}
+  try {
+    const stored = await $.store.get(USAGE_SHARED)
+    if (stored && typeof stored === 'object') shared = stored as typeof shared
+  } catch {
+    // No store: this session reads for itself.
+  }
+  const known = asExtra(shared.extra)
+  if (known && known.at > (((await read($, extra)) as Extra | null)?.at ?? -1)) await update($, extra, () => known)
+  if (typeof shared.next === 'number' && now < shared.next) return
+
+  const claim = async (next: number, reading: Extra | null) => {
+    try {
+      await $.store.set(USAGE_SHARED, { extra: reading, next })
+    } catch {
+      // Without a store the wait holds for this session only.
+    }
+  }
+  await claim(now + USAGE_EVERY, known)
+  try {
+    const auth = await $.session.authorize()
+    if (!auth || auth.kind !== 'bearer') return
+    const res = await $.http.fetch(USAGE_URL, { headers: { 'anthropic-beta': 'oauth-2025-04-20' }, auth: auth.handle })
+    if (res.status === 429) {
+      const after = Number(res.headers['retry-after'])
+      usageWait = Number.isFinite(after) && after > 0 ? Math.min(Math.max(after * 1000, USAGE_EVERY), USAGE_MAX_WAIT) : Math.min(usageWait * 2, USAGE_MAX_WAIT)
+      await claim(now + usageWait, known)
+      return
+    }
+    usageWait = USAGE_EVERY
+    if (!res.ok) return
+    const parsed = parseExtra(res.text, now)
+    await update($, extra, () => parsed)
+    await claim(now + USAGE_EVERY, parsed)
+  } catch {
+    // The details show what was last read, or no row at all.
+  }
+}
+
+// An API key pays for every request: the session's cost growth is added to this month's
+// total under its own store key, shared by the sessions of this computer.
+const spendKey = (now: number) => `spend.${new Date(now).toISOString().slice(0, 7)}`
+let lastCost: number | null = null
+let spending: Promise<void> = Promise.resolve()
+
+async function loadSpend($: EngineInterface) {
+  const key = spendKey(await $.clock.now())
+  let total = 0
+  try {
+    const stored = await $.store.get(key)
+    if (typeof stored === 'number' && Number.isFinite(stored)) total = stored
+  } catch {
+    // No store: count this session only.
+  }
+  await update($, spend, () => total)
+}
+
+async function addSpend($: EngineInterface, cost: number | undefined) {
+  if (cost === undefined) return
+  const prev = lastCost
+  lastCost = cost
+  if (prev === null || cost <= prev || (await read($, plan)) !== 'api-key') return
+  const delta = cost - prev
+  spending = spending.then(async () => {
+    const key = spendKey(await $.clock.now())
+    try {
+      const stored = await $.store.get(key)
+      const total = (typeof stored === 'number' && Number.isFinite(stored) ? stored : 0) + delta
+      await $.store.set(key, total)
+      await update($, spend, () => total)
+    } catch {
+      await update($, spend, s => (s ?? 0) + delta)
+    }
+  })
+  await spending
+}
+
+// Tells a step once: the store keeps the last step told for each window and for the month,
+// so other sessions and a reload stay quiet. Without a store, this module remembers.
+const told = new Map<string, number>()
+async function firstTime($: EngineInterface, key: string, mark: string, level: number, used?: number): Promise<boolean> {
+  try {
+    const prev = (await $.store.get(key)) as { mark?: unknown; level?: unknown; used?: unknown } | undefined
+    // Paid usage that went down started a new billing period: its steps count again.
+    const reset = used !== undefined && typeof prev?.used === 'number' && used < prev.used - 0.005
+    if (!reset && prev?.mark === mark && typeof prev.level === 'number' && prev.level >= level) return false
+    await $.store.set(key, { mark, level, ...(used !== undefined ? { used } : {}) })
+    return true
+  } catch {
+    const memo = `${key}|${mark}`
+    if ((told.get(memo) ?? 0) >= level) return false
+    told.set(memo, level)
+    return true
+  }
+}
+
+// A limit window past a warning step, or paid usage past one: a toast, once per step.
+async function checkWarnings($: EngineInterface) {
+  const cfg = (await read($, settings)) as Settings | null
+  if (!cfg) return
+  const t: Strings = TEXT[cfg.lang]
+  const now = await $.clock.now()
+  const p = await read($, plan)
+  const x = (await read($, extra)) as Extra | null
+
+  for (const r of await read($, limits)) {
+    const level = windowLevel(cfg.warnAt, r.percentUsed)
+    if (level === 0) continue
+    const resetAt = r.resetsAt ? Date.parse(r.resetsAt) : NaN
+    const mark = Number.isFinite(resetAt) ? String(Math.round(resetAt / 3_600_000)) : 'none'
+    if (!(await firstTime($, `warned.${r.kind}`, mark, level))) continue
+    const win = WINDOWS[r.kind]
+    const parts = [t.warnWindow(win ? t[win.strings].name : t.windowName(r.kind), Math.round(r.percentUsed))]
+    if (win && Number.isFinite(resetAt)) {
+      const elapsed = now - (resetAt - win.ms)
+      if (elapsed > 0 && r.percentUsed > 0 && r.percentUsed < 100) {
+        const runsOut = now + ((100 - r.percentUsed) * elapsed) / r.percentUsed
+        if (runsOut < resetAt) parts.push(t.warnRunsOut(clockTime(runsOut, t, true)))
+      }
+      parts.push(t.warnResets(clockTime(resetAt, t, true)))
+    }
+    if (level === 2 && x) parts.push(x.enabled ? t.warnThenPaid : t.warnThenStop)
+    $.ui.toast(parts.join(' · '))
+  }
+
+  const m = moneyOf(cfg, p, x, await read($, spend))
+  if (!m) return
+  const level = moneyLevel(m)
+  // An API key pays from the first request: only the shares of its budget are news.
+  if (level === 0 || (m.source === 'api' && level < 2)) return
+  if (!(await firstTime($, `warned.money.${m.source}`, new Date(now).toISOString().slice(0, 7), level, m.used))) return
+  const used = money(m.used, m.currency)
+  const cap = m.cap === null ? null : money(m.cap, m.currency)
+  const pct = m.cap ? Math.round((m.used / m.cap) * 100) : 0
+  $.ui.toast(
+    level === 1 || cap === null
+      ? t.moneyStarted(used)
+      : level < 5 || m.source === 'api'
+        ? t.moneyWarn(used, cap, pct)
+        : m.own
+          ? t.moneyCapOwnHit(cap)
+          : t.moneyCapHit(cap),
+  )
 }
 
 export const register: Register = (on, options) => {
@@ -322,13 +580,21 @@ export const register: Register = (on, options) => {
   // A TTL picked in ⚙ (the store's 'ttl') still wins over the one the login gives.
   on('session.start', async ($, e, next) => {
     $.clock.every(30_000, () => void onTick($))
-    defaultTtl = await loginTtl($, configuredTtl)
+    const signedIn = await detectPlan($)
+    await update($, plan, () => signedIn)
+    defaultTtl = loginTtl(signedIn, configuredTtl)
     const loaded = await loadSettings($, defaultTtl)
     await update($, settings, () => loaded)
     const usage = await $.session.usage()
     await save($, usage)
     await update($, startedAt, () => usage.startedAt)
+    // The cost so far was counted before a reload or belongs to an earlier run.
+    lastCost = usage.cost?.usd ?? null
+    if (signedIn === 'api-key') await loadSpend($)
     await refreshModel($)
+    usageReadAt = 0
+    await refreshExtra($)
+    await checkWarnings($)
 
     return next(e)
   })
@@ -336,6 +602,8 @@ export const register: Register = (on, options) => {
   on('session.measure', async ($, e, next) => {
     await save($, e)
     await refreshModel($)
+    await addSpend($, e.cost?.usd)
+    await checkWarnings($)
 
     return next(e)
   })
@@ -418,15 +686,29 @@ export const register: Register = (on, options) => {
     // ↻N beside the timer: the warmer will keep this cache warm N more times. It goes with the timer.
     const fullMark = show.cache && isWarm && warmNow.kind === 'armed' ? t.warmMark(cfg.warmMax - w.done) : null
 
+    // Paid usage: shown on the line once something is paid, or an API key has a budget.
+    const signedIn = await read($, plan)
+    const paid = moneyOf(cfg, signedIn, (await read($, extra)) as Extra | null, await read($, spend))
+    const paidShare = paid && paid.cap ? paid.used / paid.cap : null
+    const paidColor = paidShare === null ? '#f07a1a' : tone(100 - paidShare * 100)
+    const onLine = show.money && paid !== null && (paid.used > 0 || (paid.source === 'api' && paid.cap !== null))
+    const moneyText = (words: boolean) =>
+      paid && onLine ? t.moneyBand(money(paid.used, paid.currency), paid.cap === null ? null : money(paid.cap, paid.currency), words) : null
+
+    // A window the band has no name for (a gateway's spend limit) gets a meter of its own.
+    const otherKinds = rows.map(r => r.kind).filter(k => !WINDOWS[k])
+    const shortOf = (kind: string) => (WINDOWS[kind] ? t[WINDOWS[kind]!.strings].short : t.windowName(kind))
+
     // Width of the line in cells for a given fit, as the layout below draws it.
     const meterWidth = (kind: string, fit: Fit) => {
-      const label = t[WINDOWS[kind]!.strings].short
+      const label = shortOf(kind)
       const limit = rows.find(r => r.kind === kind)
       if (!limit) return label.length + 2
       const left = Math.max(0, Math.round(100 - limit.percentUsed))
       const resetIn = limit.resetsAt ? Date.parse(limit.resetsAt) - now : NaN
       const reset = fit.reset && Number.isFinite(resetIn) ? 1 + `· ${span(resetIn, t)}`.length : 0
-      return label.length + (fit.dots > 0 ? 1 + fit.dots : 0) + 1 + t.left(left, fit.words).length + reset
+      const mark = windowLevel(cfg.warnAt, limit.percentUsed) > 0 ? 1 + t.warnMark.length : 0
+      return label.length + (fit.dots > 0 ? 1 + fit.dots : 0) + 1 + t.left(left, fit.words).length + mark + reset
     }
     const lineWidth = (fit: Fit) => {
       const timer = fit.timer ? fullTimer : null
@@ -442,6 +724,8 @@ export const register: Register = (on, options) => {
         fit.label ? t.label.length : 0,
         show.week ? meterWidth('seven_day', fit) : 0,
         show.fiveHour ? meterWidth('five_hour', fit) : 0,
+        ...otherKinds.map(k => meterWidth(k, fit)),
+        moneyText(fit.words)?.length ?? 0,
         cache,
       ].filter(w => w > 0)
       return items.reduce((sum, w) => sum + w, 0) + items.length - 1
@@ -465,7 +749,7 @@ export const register: Register = (on, options) => {
     const priceText = fit.price ? fullPrice : null
 
     const meter = (kind: string) => {
-      const label = t[WINDOWS[kind]!.strings].short
+      const label = shortOf(kind)
       const limit = rows.find(r => r.kind === kind)
 
       if (!limit) {
@@ -492,6 +776,7 @@ export const register: Register = (on, options) => {
             </Text>
           ) : null}
           <Text color={color} weight="semibold" tabular>{t.left(left, fit.words)}</Text>
+          {windowLevel(cfg.warnAt, limit.percentUsed) > 0 ? <Text color={color} weight="bold">{t.warnMark}</Text> : null}
           {fit.reset && Number.isFinite(resetIn) ? <Text dimColor tabular>{`· ${span(resetIn, t)}`}</Text> : null}
         </Box>
       )
@@ -507,6 +792,10 @@ export const register: Register = (on, options) => {
         {fit.label ? <Text weight="bold" dimColor>{t.label}</Text> : null}
         {show.week ? meter('seven_day') : null}
         {show.fiveHour ? meter('five_hour') : null}
+        {otherKinds.map(meter)}
+        {moneyText(fit.words) ? (
+          <Text key="money" color={paidColor} weight="semibold" tabular>{moneyText(fit.words)}</Text>
+        ) : null}
         {show.cache || priceText ? (
           <Box flexDirection="row" alignItems="center" gap={1}>
             {show.cache ? <Text backgroundColor={cacheColor} color="#ffffff" weight="bold">{isWarm ? t.warm : t.cold}</Text> : null}
@@ -552,6 +841,8 @@ export const register: Register = (on, options) => {
           {row(t.langRow, (['uk', 'en'] as Lang[]).map(l => choice(`lang-${l}`, LANG_NAMES[l], cfg.lang === l, () => void change($, defaultTtl, 'lang', s => ({ ...s, lang: l })))))}
           {row(t.ttlRow, (['1h', '5m'] as const).map(v => choice(`ttl-${v}`, v, cfg.ttl === v, () => void change($, defaultTtl, 'ttl', s => ({ ...s, ttl: v })))))}
           {row(t.warmRow, WARM_CHOICES.map(n => choice(`warm-${n}`, n === 0 ? t.warmChoiceOff : String(n), cfg.warmMax === n, () => void change($, defaultTtl, 'warm.max', s => ({ ...s, warmMax: n })))))}
+          {row(t.warnRow, WARN_CHOICES.map(n => choice(`warn-${n}`, n === 0 ? t.warmChoiceOff : `${n}%`, cfg.warnAt === n, () => void change($, defaultTtl, 'warn.at', s => ({ ...s, warnAt: n })))))}
+          {row(t.budgetRow, BUDGET_CHOICES.map(n => choice(`budget-${n}`, n === 0 ? t.budgetNone : `$${n}`, cfg.budget === n, () => void change($, defaultTtl, 'money.budget', s => ({ ...s, budget: n })))))}
           {row(t.bandRow, BAND_BLOCKS.map(check))}
           {row(t.detailsRow, DETAIL_BLOCKS.map(check))}
         </Box>
@@ -579,8 +870,8 @@ export const register: Register = (on, options) => {
     )
 
     const limitRow = (kind: string) => {
-      const window = WINDOWS[kind]!
-      const label = t[window.strings].name
+      const window = WINDOWS[kind]
+      const label = window ? t[window.strings].name : t.windowName(kind)
       const limit = rows.find(r => r.kind === kind)
       if (!limit) {
         return detail(kind, label, [{ text: t.noData }])
@@ -593,7 +884,7 @@ export const register: Register = (on, options) => {
       if (Number.isFinite(resetAt)) {
         // Within a day «через …» says which day it is, so the time is enough.
         facts.push({ text: t.reset(clockTime(resetAt, t, resetAt - now >= 24 * 3_600_000), span(resetAt - now, t)) })
-        const elapsed = (now - (resetAt - window.ms)) / window.ms
+        const elapsed = window ? (now - (resetAt - window.ms)) / window.ms : NaN
         if (show.forecast && elapsed >= 0.05 && elapsed < 1) {
           const projected = Math.round(limit.percentUsed / elapsed)
           facts.push(projected >= 100 ? { text: `${t.forecast(projected)} ⚠`, color: tone(0) } : { text: t.forecast(projected) })
@@ -632,6 +923,27 @@ export const register: Register = (on, options) => {
                     ]
     const toggleWarm = () => void update($, warm, s => ({ ...s, paused: !(s as Warm).paused }))
 
+    // Paid usage: a subscription's extra usage (on or off) or an API key's month.
+    const moneyFacts: Fact[] | null = !paid
+      ? null
+      : paid.source === 'extra' && !paid.enabled && paid.used <= 0
+        ? [{ text: t.moneyOff, strong: true }, { text: t.moneyOffNote }]
+        : [
+            paid.source === 'api'
+              ? { text: t.moneyApi(money(paid.used), paid.cap === null ? null : money(paid.cap)), color: paidColor }
+              : {
+                  text: t.moneyUsed(
+                    money(paid.used, paid.currency),
+                    paid.cap === null ? null : money(paid.cap, paid.currency),
+                    paidShare === null ? null : Math.round(paidShare * 100),
+                  ),
+                  color: paidColor,
+                },
+            ...(paid.source === 'extra' && paid.cap !== null ? [{ text: paid.own ? t.moneyCapOwn : t.moneyCapOrg }] : []),
+            ...(paid.cap !== null ? [{ text: t.moneySteps(moneySteps(paid.cap, paid.currency)) }] : []),
+            { text: paid.source === 'api' ? t.moneyApiNote : t.moneyMonth },
+          ]
+
     const priceFacts: Fact[] = isWarm
       ? [
           { text: t.priceNow(usd(warmUsd)), strong: true },
@@ -667,6 +979,8 @@ export const register: Register = (on, options) => {
         {line}
         {limitRow('seven_day')}
         {limitRow('five_hour')}
+        {otherKinds.map(limitRow)}
+        {show.money && moneyFacts ? detail('money', t.rowsMoney, moneyFacts) : null}
         {detail('cache', t.rows.cache, cacheFacts)}
         {detail('warm', t.rows.warm, warmFacts)}
         {show.priceDetails && ctxTokens > 0 ? detail('price', t.rows.price, priceFacts) : null}

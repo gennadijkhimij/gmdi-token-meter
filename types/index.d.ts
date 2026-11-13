@@ -17,12 +17,27 @@ export type Blocks = {
   priceDetails: boolean
   models: boolean
   session: boolean
+  money: boolean
 }
 
 // How many times in a row the warmer may refresh an idle session's cache; 0 is off.
 export type WarmMax = 0 | 2 | 4 | 8
 
-export type Settings = { lang: Lang; ttl: '1h' | '5m'; warmMax: WarmMax; show: Blocks }
+// From what share of a limit window the band warns (95 % is always the second step); 0 is off.
+export type WarnAt = 0 | 70 | 80 | 90
+
+// The person's own monthly cap on paid usage, in dollars; 0 leaves only the organization's.
+export type Budget = 0 | 50 | 100 | 150 | 200 | 500
+
+export type Settings = { lang: Lang; ttl: '1h' | '5m'; warmMax: WarmMax; warnAt: WarnAt; budget: Budget; show: Blocks }
+
+// How the session is signed in: a subscription (Free/Pro/Max/Team/Enterprise), an API key,
+// none the engine names (a gateway, Bedrock, Vertex), or not asked yet.
+export type Plan = 'bearer' | 'api-key' | 'other' | 'unknown'
+
+// Extra usage (overage) of a subscription for the billing period, as the usage endpoint
+// reports it, in major units (dollars): `limit` null is no monthly cap.
+export type Extra = { enabled: boolean; limit: number | null; used: number | null; currency: string; at: number }
 
 export type View = 'closed' | 'details' | 'settings'
 
@@ -43,6 +58,9 @@ declare module 'claude-code' {
       view: View
       tick: number
       warm: Warm
+      plan: Plan
+      extra: Extra | null
+      spend: number | null
     }
   }
 }
