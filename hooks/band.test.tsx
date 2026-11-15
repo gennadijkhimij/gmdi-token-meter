@@ -45,14 +45,14 @@ const storeIn = (on: On, saved: Record<string, unknown>) => {
 
 // The engine beneath the plugin for one session: its clock, usage figures and model.
 // The prompts the plugin submits (the warmer's) land in `sent`.
-const session = (on: On, usage: { tokens?: number; limits?: typeof LIMITS; sent?: string[] }) => {
+const session = (on: On, usage: { tokens?: number; limits?: typeof LIMITS; sent?: string[]; model?: string }) => {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('prompt.submit', (_, e) => {
     usage.sent?.push(e.text)
     return { text: e.text }
   })
-  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('session.model', () => ({ value: usage.model ?? 'claude-opus-5-5' }))
   on('session.usage', () => ({
     value: { startedAt: NOW, context: { tokens: usage.tokens, window: 1_000_000 }, rateLimits: usage.limits ?? [] },
   }))
@@ -110,7 +110,7 @@ test('an answered turn warms the cache for an hour, then it cools', async ($, on
 
   const details = await $.ui.mount({ ...BAND, surface: 'desktop' })
   expect((await details.find({ type: 'Text', text: /^теплий до / }))?.text).toMatch(/ · остання відповідь .*, TTL 1h$/)
-  expect((await details.find({ type: 'Text', text: /^зараз / }))?.text).toBe('зараз $0.041 · після охолодження $1.66 · у 40 разів дорожче · ціни API')
+  expect((await details.find({ type: 'Text', text: /^зараз \$/ }))?.text).toBe('зараз $0.041 · після охолодження $1.66 · у 40 разів дорожче · ціни API')
   expect((await details.find({ type: 'Text', text: /^Моделі$/ }))?.text).toBe('Моделі')
   expect((await details.find({ type: 'Text', text: /^Fable / }))?.text).toBe('Fable $4.14 · Opus $1.66 (зараз) · Sonnet $0.83 · Haiku $0.21 · перший запит на моделі')
   await details.press({ key: 'toggle' })
@@ -891,4 +891,616 @@ test('the sessions share one usage reading, and a 429 waits for its Retry-After'
   expect((await ui.find({ type: 'Text', text: /^доплати / }))?.text).toBe('доплати $20/$150')
   expect((saved['usage.shared'] as { extra: { used: number } }).extra.used).toBe(20)
   await ui.unmount()
+})
+
+// Compacting while the cache is warm. 804k tokens on Opus 5.5, 1h TTL: a cold start writes
+// 804k × $4 × 2 = $6.43; compacting reads it warm ($0.16) and writes an 8k summary ($0.16),
+// and the cold start after it rewrites about 70k ($0.56).
+const BIG = 804_000
+
+// The engine's compaction beneath the plugin: each call lands in `calls`, answered by `answer`.
+const SUMMARY = [{ role: 'user' as const, text: 'Підсумок розмови', toolUses: [] }]
+const compactor = (on: On, calls: { trigger: string; instructions?: string }[], answer: () => object) => {
+  on('session.messages', () => ({ value: SUMMARY }) as never)
+  on('session.compact', (_, e) => {
+    calls.push({ trigger: e.trigger, instructions: e.instructions })
+    return answer() as never
+  })
+}
+const COMPACTED = () => ({
+  messages: SUMMARY,
+  tokensBefore: BIG,
+  tokensAfter: 62_000,
+  usage: { input_tokens: 10, output_tokens: 6_000, cache_read_input_tokens: BIG, cache_creation_input_tokens: 0 },
+})
+
+const toastsIn = (on: On, toasts: string[]) =>
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+
+test('with the warmer off, 15 minutes before the cache cools the band offers to compact, and the button compacts', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = { 'warm.max': 0 }
+  storeIn(on, saved)
+  const usage = { tokens: BIG as number | undefined }
+  session(on, usage)
+  const calls: { trigger: string }[] = []
+  compactor(on, calls, COMPACTED)
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await clock.advance(44 * 60_000)
+  expect(await band.find({ type: 'Text', text: /^⚠ / })).toBeUndefined()
+
+  // The same band, redrawn by the timer alone.
+  await clock.advance(2 * 60_000)
+  expect((await band.find({ type: 'Text', text: /^⚠ / }))?.text).toBe('⚠ кеш охолоне за 14хв: стиснути зараз ≈$0.32, потім охолодження ≈$0.56 замість $6.43')
+  expect(await band.find({ type: 'Text', text: /^авто о/ })).toBeUndefined()
+
+  // Two quick presses start one compaction.
+  await Promise.all([band.press({ key: 'compact-band' }), band.press({ key: 'compact-band' })])
+  expect(calls.length).toBe(1)
+  expect(await band.find({ type: 'Text', text: /^⚠ / })).toBeUndefined()
+  // The context is the summary now: a warm cache of 62k, $0.50 to write again once cold.
+  expect((await band.find({ type: 'Text', text: /^ще / }))?.text).toBe('ще 1г 00хв')
+  expect((await band.find({ type: 'Text', text: /→/ }))?.text).toBe('→ $0.50')
+  expect(saved['compact.learned.out']).toBe(6_000)
+  // The engine said how large the summary is: kept at once.
+  expect(saved['compact.learned.after']).toBe(62_000)
+
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^Стиснення$/ }))?.text).toBe('Стиснення')
+  expect((await band.find({ type: 'Text', text: /^стиснуто о / }))?.text).toMatch(/^стиснуто о \d\d:\d\d: 804k → 62k · наступний запит закешує новий, менший контекст$/)
+
+  // With the engine's own size known, the next reply does not overwrite it.
+  usage.tokens = 65_000
+  await $.turn.start({ text: 'далі', turnId: 'p1' })
+  await $.turn.complete({ ...ANSWERED, turnId: 'p1' })
+  expect(saved['compact.learned.after']).toBe(62_000)
+  await band.unmount()
+})
+
+// The desktop app refuses $.session.compact(): the mod runs /compact, as the person would.
+const desktopCompactor = (on: On, calls: string[], answer: () => object | Promise<object>) => {
+  on('session.messages', () => ({ value: SUMMARY }) as never)
+  // The mod's own call has no answer here, so it fails, as the desktop app's refusal does.
+  on('session.compact', (_, e) => {
+    if (e.trigger !== 'manual') throw new Error('not available in a headless (-p / SDK) session yet')
+    return { ...COMPACTED(), tokensAfter: 58_000 } as never
+  })
+  on('command.run', { command: 'compact' }, async (_, e) => {
+    calls.push(`${e.origin.kind}:${e.command}`)
+    return (await answer()) as never
+  })
+}
+
+test('in the desktop app the button runs /compact; the engine sizes are kept when the mod hears them', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, { 'warm.max': 0 })
+  session(on, { tokens: BIG })
+  const calls: string[] = []
+  // The command stays open until the test has raised the engine's compaction inside it.
+  let done = () => {}
+  const open = new Promise<void>(resolve => (done = resolve))
+  desktopCompactor(on, calls, async () => {
+    await open
+    return {}
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(50 * 60_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  const presses = Promise.all([band.press({ key: 'compact-band' }), band.press({ key: 'compact-band' })])
+  for (let i = 0; i < 1000 && !calls.length; i++) await clock.advance(0)
+  expect(calls).toEqual(['plugin:compact'])
+  // The engine's compaction, as the mod's session.compact hook hears it during the command.
+  await $.session.compact({ trigger: 'manual', messages: SUMMARY })
+  done()
+  await presses
+  expect(calls).toEqual(['plugin:compact'])
+  expect(await band.find({ type: 'Text', text: /^⚠ / })).toBeUndefined()
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^стиснуто о / }))?.text).toMatch(/: 804k → 58k · /)
+  await band.unmount()
+})
+
+test('in the desktop app a quiet /compact counts on the estimate, and a refusal it prints is told', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, { 'warm.max': 0 })
+  session(on, { tokens: BIG })
+  const calls: string[] = []
+  const answers = [{ text: 'Not enough messages to compact.' }, {}]
+  desktopCompactor(on, calls, () => answers.shift() ?? {})
+  const toasts: string[] = []
+  toastsIn(on, toasts)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(50 * 60_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'compact-band' })
+  expect(calls.length).toBe(1)
+  expect(toasts).toContain('Стиснення не вдалося: Not enough messages to compact.')
+  await band.press({ key: 'compact-band' })
+  expect(calls.length).toBe(2)
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^стиснуто о / }))?.text).toMatch(/: 804k → \d+k · /)
+  await band.unmount()
+})
+
+test('the offer shortens on a narrow band, and «не зараз» hides it for this cache', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, { 'warm.max': 0 })
+  session(on, { tokens: BIG })
+  const calls: { trigger: string }[] = []
+  compactor(on, calls, COMPACTED)
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(50 * 60_000)
+
+  const narrow = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns: 80 }, surface: 'desktop' })
+  expect((await narrow.find({ type: 'Text', text: /^⚠ / }))?.text).toBe('⚠ охолоне за 10хв: стиснути ≈$0.32 замість $6.43')
+  await narrow.unmount()
+  const tiny = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns: 40 }, surface: 'desktop' })
+  expect((await tiny.find({ type: 'Text', text: /^⚠ / }))?.text).toBe('⚠ охолоне за 10хв')
+  await tiny.unmount()
+
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'compact-dismiss' })
+  expect(await band.find({ type: 'Text', text: /^⚠ / })).toBeUndefined()
+  expect(calls).toEqual([])
+  // The details still offer it.
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^зараз ≈/ }))?.text).toBe(
+    'зараз ≈$0.32 · далі охолодження ≈$0.56 замість $6.43 · запит $0.014 замість $0.16 · вигідніше стиснути: прогрівач вимкнено · подробиці розмови замінить підсумок',
+  )
+  await band.press({ key: 'compact-now' })
+  expect(calls.length).toBe(1)
+  await band.unmount()
+})
+
+test('while the warmer keeps the cache there is no offer; the details say which pays for how long a break', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  session(on, { tokens: BIG })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(50 * 60_000)
+
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await band.find({ type: 'Text', text: /^⚠ / })).toBeUndefined()
+  await band.press({ key: 'toggle' })
+  // Compacting costs 5.5 warm-ups, but four are left: the cache keeps 10 min, then each warm-up
+  // (5 min before it would cool) adds 55 min, so warming wins for a break up to 10 min + 4 × 55 min.
+  expect((await band.find({ type: 'Text', text: /^зараз ≈/ }))?.text).toBe(
+    'зараз ≈$0.32 · далі охолодження ≈$0.56 замість $6.43 · запит $0.014 замість $0.16 · прогрів дешевший, якщо перерва до ≈3г 50хв; довша — стиснути · подробиці розмови замінить підсумок',
+  )
+  expect(await band.find({ key: 'compact-now' })).toBeDefined()
+  await band.unmount()
+})
+
+// Warm-ups are paid whole: compacting costs 5.5 of them, so warming wins until the sixth is due.
+for (const [ttl, after, warmMax, span] of [
+  ['1h', 50, 8, '4г 40хв'], // 10 min left: the 6th warm-up comes 5 min before cooling + 5 × 55 min
+  ['1h', 50, 2, '2г 00хв'], // only 2 left: the cache holds 10 min + 2 × 55 min, then cools
+  ['5m', 2, 8, '18хв'], // 5m: compacting costs 4.2 warm-ups; the 5th comes 3 − 1 + 4 × 4 min on
+] as const) {
+  test(`with ${warmMax} warm-ups on a ${ttl} cache, warming wins for a break up to ${span}`, async ($, on) => {
+    const clock = mock.clock(on, { now: NOW })
+    mock.store(on, { 'warm.max': warmMax, ttl })
+    session(on, { tokens: BIG })
+
+    await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+    await $.turn.complete(ANSWERED)
+    await clock.advance(after * 60_000)
+
+    const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+    await band.press({ key: 'toggle' })
+    expect((await band.find({ type: 'Text', text: /^зараз ≈/ }))?.text).toContain(`прогрів дешевший, якщо перерва до ≈${span};`)
+    await band.unmount()
+  })
+}
+
+test('with the warmer standing down on a low weekly limit the band offers compacting and says why', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const low = [{ ...LIMITS[0]!, percentUsed: 97 }, LIMITS[1]!]
+  session(on, { tokens: BIG, limits: low })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(50 * 60_000)
+
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^⚠ кеш/ }))?.text).toMatch(/^⚠ кеш охолоне за 10хв: /)
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^зараз ≈/ }))?.text).toMatch(/ · вигідніше стиснути: прогрівач стоїть, мало ліміту 7Д · /)
+  await band.unmount()
+})
+
+test('auto-compact, when on, compacts an idle session five minutes before the cache cools, once', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, { 'warm.max': 0, 'compact.auto': true })
+  session(on, { tokens: BIG })
+  const calls: { trigger: string }[] = []
+  compactor(on, calls, COMPACTED)
+  const toasts: string[] = []
+  toastsIn(on, toasts)
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await clock.advance(50 * 60_000)
+  expect((await band.find({ type: 'Text', text: /^авто о/ }))?.text).toMatch(/^авто о \d\d:\d\d$/)
+  await clock.advance(4 * 60_000)
+  expect(calls).toEqual([])
+
+  await clock.advance(60_000)
+  expect(calls.length).toBe(1)
+  expect(toasts.some(x => x.startsWith('⇲ Сесію стиснуто автоматично, поки кеш був теплий: 804k → 62k'))).toBe(true)
+  await clock.advance(10 * 60_000)
+  expect(calls.length).toBe(1)
+  await band.unmount()
+})
+
+test('auto-compact keeps still while a turn runs and after «не зараз»', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, { 'warm.max': 0, 'compact.auto': true })
+  session(on, { tokens: BIG })
+  const calls: { trigger: string }[] = []
+  compactor(on, calls, COMPACTED)
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await $.turn.start({ text: 'довга задача', turnId: 'long' })
+  await clock.advance(58 * 60_000)
+  expect(calls).toEqual([])
+  await $.turn.complete({ ...ANSWERED, turnId: 'long' })
+
+  await clock.advance(50 * 60_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'compact-dismiss' })
+  await clock.advance(8 * 60_000)
+  expect(calls).toEqual([])
+  await band.unmount()
+})
+
+test('auto-compact is off by default: the offer shows, nothing compacts on its own', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, { 'warm.max': 0 })
+  session(on, { tokens: BIG })
+  const calls: { trigger: string }[] = []
+  compactor(on, calls, COMPACTED)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(58 * 60_000)
+  expect(calls).toEqual([])
+})
+
+test('a press while a turn runs says so; a veto is told in a toast and in the details', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, { 'warm.max': 0 })
+  session(on, { tokens: BIG })
+  const calls: { trigger: string }[] = []
+  compactor(on, calls, () => ({ skip: 'заборонено хуком' }))
+  const toasts: string[] = []
+  toastsIn(on, toasts)
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(50 * 60_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+
+  await $.turn.start({ text: 'ще одне', turnId: 'busy' })
+  await band.press({ key: 'compact-band' })
+  expect(calls).toEqual([])
+  expect(toasts).toContain('Стиснення не запущено: Claude зараз працює. Спробуйте, коли відповідь закінчиться.')
+  await $.turn.complete({ ...FAILED, turnId: 'busy' })
+
+  await band.press({ key: 'compact-band' })
+  expect(calls.length).toBe(1)
+  expect(toasts).toContain('Стиснення не вдалося: заборонено хуком')
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^не вдалося/ }))?.text).toMatch(/^не вдалося: заборонено хуком · зараз ≈\$0\.32 · /)
+  await band.unmount()
+})
+
+test('a small context, a cheap cold start and a cold cache are not worth an offer', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store: Record<string, unknown> = { 'warm.max': 0 }
+  storeIn(on, store)
+  const usage = { tokens: 120_000 as number | undefined }
+  session(on, usage)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(50 * 60_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await band.find({ type: 'Text', text: /^⚠ / })).toBeUndefined()
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^не потрібне/ }))?.text).toBe('не потрібне: контекст ще малий')
+  expect(await band.find({ key: 'compact-now' })).toBeUndefined()
+  await band.unmount()
+})
+
+test('the person\'s own /compact is followed too, and ⚙ sets the offer, its threshold and auto-compact', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  storeIn(on, saved)
+  session(on, { tokens: BIG })
+  compactor(on, [], COMPACTED)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await $.session.compact({ trigger: 'manual', messages: SUMMARY })
+
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /→/ }))?.text).toBe('→ $0.50')
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^стиснуто о / }))?.text).toMatch(/: 804k → 62k · /)
+
+  await band.press({ key: 'open-settings' })
+  await band.press({ key: 'compact-at-0' })
+  await band.press({ key: 'compact-min-2' })
+  await band.press({ key: 'compact-auto-on' })
+  expect(saved).toEqual({ 'compact.learned.after': 62_000, 'compact.learned.out': 6_000, 'compact.at': 0, 'compact.min': 2, 'compact.auto': true })
+  await band.unmount()
+})
+
+test('the offer and its details read in English', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, { 'warm.max': 0, lang: 'en' })
+  session(on, { tokens: BIG })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(50 * 60_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^⚠ / }))?.text).toBe('⚠ cache cools in 10m: compact now ≈$0.32, then a cold start ≈$0.56 instead of $6.43')
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^now ≈/ }))?.text).toMatch(/ · compacting pays: the warmer is off · a summary replaces the conversation in detail$/)
+  await band.unmount()
+})
+
+test('a window whose reset has passed counts as unused before the next reply: no ⚠, the warmer resumes, the details say it reset', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const toasts = toastsOf(on)
+  const sent: string[] = []
+  const spent = [LIMITS[0]!, { ...LIMITS[1]!, percentUsed: 97 }]
+  session(on, { tokens: 207_000, limits: spent, sent })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  expect(toasts.filter(x => x.includes('5 годин'))).toHaveLength(1)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /вільно$/ }))?.text).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /^3% вільно$/ }))?.text).toBe('3% вільно')
+  expect((await ui.find({ type: 'Text', text: /^⚠$/ }))?.text).toBe('⚠')
+
+  // 14:17 Kyiv passes with the session idle: the engine sends nothing new, the mod knows the window is fresh.
+  await clock.advance(18 * 60_000)
+  expect((await ui.find({ type: 'Text', text: /^3% вільно$/ }))).toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: /^100% вільно$/ }))?.text).toBe('100% вільно')
+  expect(await ui.find({ type: 'Text', text: /^⚠$/ })).toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: /17хв/ }))).toBeUndefined()
+
+  await ui.press({ key: 'toggle' })
+  const details = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await details.find({ type: 'Text', text: /^0% використано/ }))?.text).toBe('0% використано · скинуто 14:17, точні дані — з наступною відповіддю')
+
+  // The low 5-hour share had held the warmer back; with the window fresh it warms on time.
+  await clock.advance(38 * 60_000)
+  expect(sent).toHaveLength(1)
+  expect(toasts.filter(x => x.includes('5 годин'))).toHaveLength(1)
+})
+
+test('in the desktop app a /compact another hook vetoes is told, and the context stays as it was', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, { 'warm.max': 0 })
+  session(on, { tokens: BIG })
+  const calls: string[] = []
+  const toasts: string[] = []
+  toastsIn(on, toasts)
+  on('session.messages', () => ({ value: SUMMARY }) as never)
+  on('session.compact', (_, e) => {
+    if (e.trigger !== 'manual') throw new Error('not available in a headless (-p / SDK) session yet')
+    return { skip: 'заборонено хуком' } as never
+  })
+  // The command stays open until the test has raised the (vetoed) compaction inside it; it prints nothing.
+  let done = () => {}
+  const open = new Promise<void>(resolve => (done = resolve))
+  on('command.run', { command: 'compact' }, async (_, e) => {
+    calls.push(e.command)
+    await open
+    return {} as never
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(50 * 60_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  const press = band.press({ key: 'compact-band' })
+  for (let i = 0; i < 1000 && !calls.length; i++) await clock.advance(0)
+  expect(calls).toEqual(['compact'])
+  await $.session.compact({ trigger: 'manual', messages: SUMMARY })
+  done()
+  await press
+  // Still the large context, still the cold start it costs.
+  expect((await band.find({ type: 'Text', text: /→/ }))?.text).toBe('→ $6.43')
+  await band.press({ key: 'toggle' })
+  expect(toasts).toContain('Стиснення не вдалося: заборонено хуком')
+  expect((await band.find({ type: 'Text', text: /^не вдалося/ }))?.text).toMatch(/^не вдалося: заборонено хуком/)
+  expect(await band.find({ type: 'Text', text: /^стиснуто о / })).toBeUndefined()
+  await band.unmount()
+})
+
+test('a turn that begins while the compaction gets ready stops it before /compact runs', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, { 'warm.max': 0 })
+  session(on, { tokens: BIG })
+  const calls: string[] = []
+  const toasts: string[] = []
+  toastsIn(on, toasts)
+  desktopCompactor(on, calls, () => ({}))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(50 * 60_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  // The person sends a prompt while the press is still on its way to /compact.
+  const press = band.press({ key: 'compact-band' })
+  await $.turn.start({ text: 'нове питання', turnId: 'race' })
+  await press
+  expect(calls).toEqual([])
+  expect(toasts).toContain('Стиснення не запущено: Claude зараз працює. Спробуйте, коли відповідь закінчиться.')
+  await band.press({ key: 'toggle' })
+  expect(await band.find({ type: 'Text', text: /^не вдалося/ })).toBeUndefined()
+  expect(await band.find({ type: 'Text', text: /^стиснуто о / })).toBeUndefined()
+  await band.unmount()
+})
+
+test('in the terminal a refusal other than «headless» is told, not retried as /compact', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, { 'warm.max': 0 })
+  session(on, { tokens: BIG })
+  const calls: string[] = []
+  const toasts: string[] = []
+  toastsIn(on, toasts)
+  on('session.messages', () => ({ value: SUMMARY }) as never)
+  on('session.compact', () => {
+    throw new Error('compaction is already running')
+  })
+  on('command.run', { command: 'compact' }, (_, e) => {
+    calls.push(e.command)
+    return {} as never
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(50 * 60_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await band.press({ key: 'compact-band' })
+  expect(calls).toEqual([])
+  expect(toasts.some(x => x.startsWith('Стиснення не вдалося: '))).toBe(true)
+  await band.unmount()
+})
+
+test('after a compaction a switch to another model leaves the cache cold', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const usage = { tokens: BIG as number | undefined, model: 'claude-opus-5-5' }
+  session(on, usage)
+  compactor(on, [], COMPACTED)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await $.session.compact({ trigger: 'manual', messages: SUMMARY })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /ТЕПЛО/ }))?.text).toBe(' ТЕПЛО ')
+
+  // /model sonnet: the summary was cached for Opus, so the next request writes it again.
+  usage.model = 'claude-sonnet-5-5'
+  await clock.advance(60_000)
+  expect((await band.find({ type: 'Text', text: /ХОЛОД/ }))?.text).toBe(' ХОЛОД ')
+  await band.unmount()
+})
+
+test('a large summary the engine reports is kept for later estimates', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  storeIn(on, saved)
+  session(on, { tokens: BIG })
+  compactor(on, [], () => ({ ...COMPACTED(), tokensAfter: 500_000 }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await $.session.compact({ trigger: 'manual', messages: SUMMARY })
+  expect(saved['compact.learned.after']).toBe(500_000)
+})
+
+test('without the engine\'s size, the reply to the next turn teaches it, however large, and no losing offer follows', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = { 'warm.max': 0, 'compact.auto': true }
+  storeIn(on, saved)
+  const usage = { tokens: BIG as number | undefined }
+  session(on, usage)
+  const calls: { trigger: string }[] = []
+  // The engine compacted but named no size afterwards.
+  compactor(on, calls, () => {
+    const { tokensAfter: _, ...rest } = COMPACTED()
+    return rest
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(50 * 60_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'compact-band' })
+  expect(calls.length).toBe(1)
+  expect(saved['compact.learned.after']).toBeUndefined()
+
+  // A turn that ends without having begun after the compaction (the compacting turn's own) teaches nothing.
+  await $.turn.complete({ ...ANSWERED, turnId: 'c0' })
+  expect(saved['compact.learned.after']).toBeUndefined()
+
+  // The next turn's reply: the context stayed large, and that is what is kept.
+  usage.tokens = 750_000
+  await $.turn.start({ text: 'далі', turnId: 'p1' })
+  await $.turn.complete({ ...ANSWERED, turnId: 'p1' })
+  expect(saved['compact.learned.after']).toBe(750_000)
+
+  // 55 minutes on, compacting 750k again would cost as much as the cold start: no offer, no auto-compact.
+  await clock.advance(55 * 60_000)
+  expect(await band.find({ type: 'Text', text: /^⚠ / })).toBeUndefined()
+  expect(calls.length).toBe(1)
+  await band.unmount()
+})
+
+test('«не зараз» pressed while an auto-compaction gets ready stops it before /compact runs', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, { 'warm.max': 0, 'compact.auto': true })
+  session(on, { tokens: BIG })
+  const calls: string[] = []
+  on('session.messages', () => ({ value: SUMMARY }) as never)
+  on('command.run', { command: 'compact' }, (_, e) => {
+    calls.push(e.command)
+    return {} as never
+  })
+  // The person presses «не зараз» just as the mod, having decided to compact, marks it as running:
+  // the offer is still drawn, /compact has not been raised yet.
+  let press: (() => Promise<unknown>) | null = null
+  let pressed = false
+  on('state.set', async (_, e, next) => {
+    const v = e.value as { state?: string; auto?: boolean } | null
+    if (!pressed && e.key === 'compaction' && v?.state === 'running' && v.auto) {
+      pressed = true
+      await press?.()
+    }
+    return next(e)
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.complete(ANSWERED)
+  await clock.advance(50 * 60_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  press = () => band.press({ key: 'compact-dismiss' })
+  await clock.advance(8 * 60_000)
+  expect(pressed).toBe(true)
+  expect(calls).toEqual([])
+  await band.press({ key: 'toggle' })
+  expect(await band.find({ type: 'Text', text: /^стиснуто о / })).toBeUndefined()
+  // Nothing more on its own for this cache.
+  await clock.advance(60_000)
+  expect(calls).toEqual([])
+  await band.unmount()
 })

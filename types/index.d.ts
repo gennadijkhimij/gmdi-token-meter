@@ -29,7 +29,24 @@ export type WarnAt = 0 | 70 | 80 | 90
 // The person's own monthly cap on paid usage, in dollars; 0 leaves only the organization's.
 export type Budget = 0 | 50 | 100 | 150 | 200 | 500
 
-export type Settings = { lang: Lang; ttl: '1h' | '5m'; warmMax: WarmMax; warnAt: WarnAt; budget: Budget; show: Blocks }
+// How many minutes before the cache cools the band offers to compact the session; 0 is off.
+export type CompactAt = 0 | 10 | 15 | 20
+
+// The least a cold restart must cost, in dollars, before compacting is offered.
+export type CompactMin = 0.5 | 1 | 2 | 5
+
+export type Settings = {
+  lang: Lang
+  ttl: '1h' | '5m'
+  warmMax: WarmMax
+  warnAt: WarnAt
+  budget: Budget
+  compactAt: CompactAt
+  compactMin: CompactMin
+  // Compact on its own once the cache is about to cool and the session is idle; off by default.
+  compactAuto: boolean
+  show: Blocks
+}
 
 // How the session is signed in: a subscription (Free/Pro/Max/Team/Enterprise), an API key,
 // none the engine names (a gateway, Bedrock, Vertex), or not asked yet.
@@ -43,6 +60,22 @@ export type View = 'closed' | 'details' | 'settings'
 
 // The warmer in this session: paused by the person, and how many prompts it sent since their last one.
 export type Warm = { paused: boolean; done: number; lastAt: number | null }
+
+// The last compaction of this session as the mod saw it: running, done (sizes in tokens) or failed.
+// `dismissedFor` / `autoFor`: the cache (its reply time) the offer was dismissed or auto-compacted for.
+export type Compaction = {
+  state: 'idle' | 'running' | 'done' | 'failed'
+  at: number | null
+  before: number | null
+  after: number | null
+  reason: string | null
+  auto: boolean
+  dismissedFor: number | null
+  autoFor: number | null
+}
+
+// What earlier compactions on this computer came to: the context after one, the summary's length.
+export type Learned = { after: number | null; out: number | null }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -61,6 +94,8 @@ declare module 'claude-code' {
       plan: Plan
       extra: Extra | null
       spend: number | null
+      compaction: Compaction
+      learned: Learned
     }
   }
 }

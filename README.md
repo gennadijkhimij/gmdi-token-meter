@@ -10,11 +10,11 @@
 
 ## Що показує
 
-- **7Д і 5Г** — скільки лишилося тижневого й п'ятигодинного лімітів і коли вони скинуться. Колір: ≥80 % жовтий, ≥40 % помаранчевий, менше червоний.
+- **7Д і 5Г** — скільки лишилося тижневого й п'ятигодинного лімітів і коли вони скинуться. Колір: ≥80 % жовтий, ≥40 % помаранчевий, менше червоний. Цифри лімітів Claude надсилає лише разом із відповіддю. Тому, коли час скидання минув, а сесія простоює, мод сам вважає вікно вільним (100 %, без ⚠). У деталях тоді видно «скинуто 14:17, точні дані — з наступною відповіддю».
 - **ТЕПЛО / ХОЛОД** — чи ще живий кеш запитів після останньої відповіді і скільки йому лишилося (TTL 1h на підписці, 5m на API-ключі).
 - **→ $X** — скільки коштуватиме перший запит, коли кеш охолоне й контекст доведеться записати заново.
 - **▾** розгортає деталі: скидання лімітів за київським часом і прогноз на кінець вікна, стан кешу, ціна продовження, ціни для інших моделей, контекст і вартість сесії.
-- **⚙** — налаштування: мова (uk/en), які блоки показувати, TTL кешу, прогрівач, поріг попереджень, бюджет доплат.
+- **⚙** — налаштування: мова (uk/en), які блоки показувати, TTL кешу, прогрівач, поріг попереджень, бюджет доплат, пропозиція стиснення та автостиснення.
 
 ## Попередження про ліміти й доплати
 
@@ -34,6 +34,20 @@
 - Не прогріває, поки Claude працює, при контексті менше 20k, коли лишилося < 10 % ліміту 5Г або < 5 % тижневого, і коли кеш уже холодний.
 - `↻N` у смузі — скільки прогрівів ще лишилося. ▾ → «Прогрів»: коли наступний і скільки зроблено; кнопка «⏸ Не прогрівати цю сесію».
 - Прогрів витрачає ліміт: кожен запит — це окремий хід моделі. Працює, лише поки сесія відкрита й комп'ютер не спить.
+
+## Стиснення, поки кеш теплий
+
+Коли розмова велика, перший запит після години простою записує в кеш увесь контекст заново: для 804k токенів на Opus 5.5 це ≈$6.43 (запис 1h = вхід × 2). Стиснення (`/compact`) тим часом коштує одне читання контексту з теплого кешу і вихід підсумку: ≈$0.16 + $0.16. Після нього охолодження перезаписує лише підсумок і системний промпт (≈70k, ≈$0.56).
+
+- **Пропозиція.** Кеш теплий, до охолодження лишилося ≤15 хв (у ⚙: 10/15/20 хв або «вимк»), охолодження коштуватиме понад $1 (у ⚙: $0.5/1/2/5), а стиснення разом із наступним холодним стартом обійдеться щонайменше вдвічі дешевше. Тоді під смугою з'являється рядок:
+  `⚠ кеш охолоне за 14хв: стиснути зараз ≈$0.32, потім охолодження ≈$0.56 замість $6.43  [⇲ Стиснути зараз] не зараз`
+  На вузькій смузі текст коротшає. «Не зараз» ховає рядок до наступної відповіді.
+- **Кнопка «⇲ Стиснути зараз»** (у рядку пропозиції та в деталях ▾ → «Стиснення») запускає те саме стиснення, що й `/compact`. У терміналі мод викликає `$.session.compact()`. Застосунок Claude (вкладка Code) такого виклику модам не дозволяє, тож там мод одразу виконує команду `/compact` від свого імені (`$.command.run`); у розмові це видно як рядок `/compact … Compacted`. Якщо Claude саме працює або починає відповідь, поки мод готує стиснення, мод нічого не запускає й пояснює це сповіщенням. Якщо стиснення заборонив інший хук (і в терміналі, і під час `/compact` у застосунку) або воно не вдалося, причина з'явиться в сповіщенні й у деталях, а смуга й далі рахує великий контекст. Поки стиснення триває, у смузі видно «стискаю сесію…».
+- **Автостиснення** (⚙, типово вимкнене). Коли пропозиція стоїть, сесія простоює і до охолодження лишилося 5 хв (1 хв при TTL 5m), мод стискає сесію сам: один раз на кожен кеш, не після «не зараз» і не під час ходу. Після стиснення приходить сповіщення «сесію стиснуто автоматично: 804k → 62k».
+- **Прогрівач і стиснення.** Поки прогрівач тримає кеш теплим, пропозиції в смузі немає. У деталях тоді видно, що вигідніше: «прогрів дешевший, якщо перерва до ≈3г 50хв; довша — стиснути» (кожен прогрів — окремий запит, що читає весь контекст і продовжує кеш на TTL мінус 5 хв запасу — 1 хв при 5m; рахуються цілі прогріви; після останнього кеш однаково охолоне). Коли прогрівач вимкнено, поставлено на паузу, прогріви вичерпано чи він стоїть через «мало ліміту 7Д / 5Г», мод пропонує стиснення й пише причину: «вигідніше стиснути: прогрівач стоїть, мало ліміту 7Д».
+- **Деталі «Стиснення»:** ціна зараз, ціна охолодження після нього, ціна кожного наступного запиту («запит $0.014 замість $0.16») і нагадування, що подробиці розмови замінить підсумок.
+- **Точність.** Розмір контексту після стиснення (70k) і довжина підсумку (8k) спершу оцінкові. Після першого стиснення на цьому комп'ютері мод запам'ятовує справжні числа (розмір — той, що назвав рушій, а якщо рушій його не назвав, — з відповіді на наступний хід; навіть якщо контекст лишився великим) і бере їх для наступних оцінок. Кеш підсумку прив'язаний до моделі сесії: якщо після стиснення перемкнути `/model`, смуга покаже ХОЛОД. Це стосується й стиснень, які ви робите самі через `/compact`, якщо мод їх чує: інший плагін, який обробляє стиснення раніше за мод (наприклад, плагін безпеки організації), може їх від мода приховати. Після стиснення в застосунку рушій не знає розміру контексту до наступної відповіді; до того смуга рахує за оцінкою.
+- **Обмеження.** Стиснення замінює розмову підсумком, і дрібні подробиці губляться. Рушій не дає стискати посеред ходу, тому мод чекає, поки сесія простоює. Ціни — за прайсом API; на підписці це міра витраченого ліміту.
 
 ## Встановлення
 
@@ -80,11 +94,13 @@ claude plugin install gmdi-token-meter --marketplace gennadijkhimij/gmdi-token-m
 
 ## English
 
-A mod for Claude Code (the Claude desktop app's Code tab and the terminal): a band above the prompt showing weekly (7D) and five-hour (5H) usage left with reset times, whether the prompt cache is still warm, and what the first request costs once it has gone cold. ▾ opens details, ⚙ opens settings (language uk/en, which blocks to show, cache TTL 1h or 5m, warmer).
+A mod for Claude Code (the Claude desktop app's Code tab and the terminal): a band above the prompt showing weekly (7D) and five-hour (5H) usage left with reset times (Claude sends those figures only with a reply, so once a reset time has passed in an idle session the mod counts that window as unused until the next reply), whether the prompt cache is still warm, and what the first request costs once it has gone cold. ▾ opens details, ⚙ opens settings (language uk/en, which blocks to show, cache TTL 1h or 5m, warmer, compact offer and auto-compact).
 
 **Warnings.** For any sign-in (Free, Pro, Max, Team, Enterprise, API key, gateway): a window past 80 % (70/80/90 % or off in ⚙) gets a ⚠ and one toast with when it runs out at this pace; 95 % warns again and says whether extra usage or a stop comes next. A subscription's extra usage is read from the same endpoint as `/usage` (shared by all open sessions, at most every 5 minutes): the band shows `extra $52/$150`, and toasts come when it starts, at ⅓, ⅔ and 14/15 of the cap and at the cap. A budget in ⚙ ($50–500/month) is your own cap when it is below the organization's. With an API key the mod counts this computer's spend for the month and warns at the shares of that budget.
 
 **Cache warmer.** Five minutes before the TTL runs out (one minute at 5m) the mod sends a one-word prompt that reads the cache and renews it, up to 4 times in a row by default (2, 8 or off in ⚙). Your next prompt restarts the count. It skips while Claude is working, below 20k context, below 10 % of the 5H limit or 5 % of the weekly one, and once the cache is cold. Each warm-up is a model turn and counts against your usage.
+
+**Compact while the cache is warm.** With a large conversation, the first request after the cache cools writes the whole context again (804k tokens on Opus 5.5 ≈ $6.43), while compacting costs one warm read plus the summary (≈ $0.32), and the cold start after it rewrites only the summary and system prompt (≈ $0.56). When the cache is warm, cools within 15 minutes (10/15/20 or off in ⚙), a cold start would cost over $1 (0.5/1/2/5 in ⚙) and compacting halves that at least, a row under the band offers it: `⚠ cache cools in 14m: compact now ≈$0.32, then a cold start ≈$0.56 instead of $6.43 [⇲ Compact now] not now`. The button runs the same compaction as `/compact`: `$.session.compact()` in the terminal; the desktop app does not allow mods that call, so there the mod runs the `/compact` command itself (`$.command.run`), shown in the conversation as `/compact … Compacted`; it waits while Claude is working (also when a reply starts while it gets ready) and reports a veto (from any hook, in both cases) or failure. Auto-compact (off by default in ⚙) compacts an idle session five minutes before the cache cools (one minute at 5m), once per cache. While the warmer keeps the cache, there is no offer; the details say how long a break warming still beats compacting (warm-ups are counted whole, each one TTL less the warmer's lead apart). When the warmer is off, paused, used up or standing down on a low limit, the offer says so. The size after compaction (70k) and the summary length (8k) start as estimates and are learned from the first real compaction on the computer: the size the engine names, or, when it names none, the one the next turn's reply measures, however large (your own `/compact` counts too, unless a plugin that handles compaction before this mod hides it). A summary replaces the conversation in detail.
 
 **Install.** In a Claude Code terminal session:
 

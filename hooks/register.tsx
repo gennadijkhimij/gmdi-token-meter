@@ -1,7 +1,17 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderChildren, SessionContextUsage, SessionCost, SessionRateLimit } from 'claude-code'
+import type {
+  EngineInterface,
+  Register,
+  RenderChildren,
+  SessionCompacted,
+  SessionCompactInput,
+  SessionCompactResult,
+  SessionContextUsage,
+  SessionCost,
+  SessionRateLimit,
+} from 'claude-code'
 
-import type { Blocks, Budget, Context, Extra, Lang, Limit, Plan, Settings, View, Warm, WarmMax, WarnAt } from '../types'
+import type { Blocks, Budget, CompactAt, CompactMin, Compaction, Context, Extra, Lang, Learned, Limit, Plan, Settings, View, Warm, WarmMax, WarnAt } from '../types'
 import { LANG_NAMES, TEXT } from './i18n'
 import type { Strings } from './i18n'
 
@@ -25,6 +35,10 @@ const plan = atom({ plugin: 'gmdi-token-meter', key: 'plan' } as const, 'unknown
 const extra = atom({ plugin: 'gmdi-token-meter', key: 'extra' } as const, null as Extra | null)
 // An API key's spend this month on this computer, as the mod has counted it.
 const spend = atom({ plugin: 'gmdi-token-meter', key: 'spend' } as const, null as number | null)
+const NO_COMPACTION: Compaction = { state: 'idle', at: null, before: null, after: null, reason: null, auto: false, dismissedFor: null, autoFor: null }
+// This session's last compaction, and what compactions on this computer came to (from the store).
+const compaction = atom({ plugin: 'gmdi-token-meter', key: 'compaction' } as const, NO_COMPACTION)
+const learned = atom({ plugin: 'gmdi-token-meter', key: 'learned' } as const, { after: null, out: null } as Learned)
 
 // A details fact: colored, plain (strong) or dim.
 type Fact = { text: string; color?: string; strong?: boolean }
@@ -33,7 +47,7 @@ type Fact = { text: string; color?: string; strong?: boolean }
 // change in one session never overwrites what another session changed. The one
 // object under 'settings' is how 0.1 kept them: read as the base, never written.
 const LEGACY_KEY = 'settings'
-type SettingKey = 'lang' | 'ttl' | 'warm.max' | 'warn.at' | 'money.budget' | `show.${keyof Blocks}`
+type SettingKey = 'lang' | 'ttl' | 'warm.max' | 'warn.at' | 'money.budget' | 'compact.at' | 'compact.min' | 'compact.auto' | `show.${keyof Blocks}`
 const DOTS = 10
 const DIM = '#5b5b5b'
 // The details' label column, in cells: fits «Тиждень» / «Session» and a gap.
@@ -64,12 +78,28 @@ const MONEY_SHARES: readonly number[] = [1 / 3, 2 / 3, 14 / 15]
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 const USAGE_EVERY = 5 * 60_000
 
+// Compacting while the cache is warm: the summarizer reads the context once at the cache price
+// and writes a summary, so the next cold start rewrites only that summary and the system prompt.
+const COMPACT_AT_CHOICES: readonly CompactAt[] = [0, 10, 15, 20]
+const COMPACT_MIN_CHOICES: readonly CompactMin[] = [0.5, 1, 2, 5]
+// Until a compaction on this computer has shown better: the context after one (system prompt,
+// tools and summary) and the summary's length, in tokens.
+const COMPACT_AFTER = 70_000
+const COMPACT_OUT = 8_000
+// The offer shows only where compacting and its cold start cost at most this share of a cold start.
+const COMPACT_GAIN = 0.5
+const STORE_AFTER = 'compact.learned.after'
+const STORE_OUT = 'compact.learned.out'
+
 const defaults = (ttl: '1h' | '5m'): Settings => ({
   lang: 'uk',
   ttl,
   warmMax: 4,
   warnAt: 80,
   budget: 0,
+  compactAt: 15,
+  compactMin: 1,
+  compactAuto: false,
   show: { label: true, week: true, fiveHour: true, reset: true, words: true, cache: true, price: true, money: true, forecast: true, priceDetails: true, models: true, session: true },
 })
 
@@ -78,7 +108,17 @@ const defaults = (ttl: '1h' | '5m'): Settings => ({
 const withDefaults = (stored: unknown, ttl: '1h' | '5m'): Settings => {
   const base = defaults(ttl)
   if (!stored || typeof stored !== 'object') return base
-  const s = stored as { lang?: unknown; ttl?: unknown; warmMax?: unknown; warnAt?: unknown; budget?: unknown; show?: unknown }
+  const s = stored as {
+    lang?: unknown
+    ttl?: unknown
+    warmMax?: unknown
+    warnAt?: unknown
+    budget?: unknown
+    compactAt?: unknown
+    compactMin?: unknown
+    compactAuto?: unknown
+    show?: unknown
+  }
   const shown = s.show && typeof s.show === 'object' ? (s.show as Record<string, unknown>) : {}
   const show = { ...base.show }
   for (const key of Object.keys(show) as (keyof Blocks)[]) {
@@ -91,6 +131,9 @@ const withDefaults = (stored: unknown, ttl: '1h' | '5m'): Settings => {
     warmMax: WARM_CHOICES.find(n => n === s.warmMax) ?? base.warmMax,
     warnAt: WARN_CHOICES.find(n => n === s.warnAt) ?? base.warnAt,
     budget: BUDGET_CHOICES.find(n => n === s.budget) ?? base.budget,
+    compactAt: COMPACT_AT_CHOICES.find(n => n === s.compactAt) ?? base.compactAt,
+    compactMin: COMPACT_MIN_CHOICES.find(n => n === s.compactMin) ?? base.compactMin,
+    compactAuto: typeof s.compactAuto === 'boolean' ? s.compactAuto : base.compactAuto,
     show,
   }
 }
@@ -137,11 +180,12 @@ const clockTime = (ms: number, t: Strings, withDay = false): string => {
   }
 }
 
-// List prices, $ per million input tokens: a plain input and a cache read.
+// List prices, $ per million tokens: a plain input and a cache read; output is five times the input.
 // A cache write costs the input price × 2 with the 1h TTL, × 1.25 with 5m.
 // `above`: the dearer tier for a prompt longer than its `tokens` (Haiku 5.5 past 100K).
 // First match wins, so a longer id comes before its prefix.
 type Rate = { input: number; read: number }
+const OUTPUT_MULT = 5
 const PRICES: readonly ({ match: string; above?: Rate & { tokens: number } } & Rate)[] = [
   { match: 'fable', input: 10, read: 0.25 },
   { match: 'mythos', input: 10, read: 0.25 },
@@ -181,6 +225,20 @@ type WarmStatus =
   | { kind: 'limits'; window: 'week' | 'fiveHour' }
   | { kind: 'armed'; at: number }
 
+// A limit row as it stands at `now`. The engine's figures come with each response, so a session
+// left idle past a window's reset still holds the old share: that window has started afresh,
+// and it counts as unused (with no next reset known) until the next response brings real ones.
+type Row = Limit & { renewedAt?: number }
+const liveRows = (rows: readonly Limit[], now: number): Row[] =>
+  rows.map(r => {
+    const at = r.resetsAt ? Date.parse(r.resetsAt) : NaN
+    return Number.isFinite(at) && now >= at ? { kind: r.kind, percentUsed: 0, renewedAt: at } : r
+  })
+
+async function readRows($: EngineInterface, now: number): Promise<Row[]> {
+  return liveRows(await read($, limits), now)
+}
+
 const warmStatus = (s: Settings, w: Warm, replyAt: number | null, now: number, ctxTokens: number, rows: readonly Limit[]): WarmStatus => {
   if (s.warmMax === 0) return { kind: 'off' }
   if (w.paused) return { kind: 'paused' }
@@ -193,7 +251,67 @@ const warmStatus = (s: Settings, w: Warm, replyAt: number | null, now: number, c
     const floor = WARM_FLOOR[r.kind]
     if (floor !== undefined && 100 - r.percentUsed < floor) return { kind: 'limits', window: WINDOWS[r.kind]!.strings }
   }
-  return { kind: 'armed', at: replyAt + ttlMs - (s.ttl === '5m' ? 60_000 : 5 * 60_000) }
+  return { kind: 'armed', at: replyAt + ttlMs - warmLeadMs(s) }
+}
+
+// The warmer fires this long before the cache would cool; each warm-up so keeps it one TTL less this lead.
+const warmLeadMs = (s: Settings): number => (s.ttl === '5m' ? 60_000 : 5 * 60_000)
+
+// What compacting now costs and what it leaves, for `ctx` tokens on model `id`: `now` is the
+// summarizer's request (the context read from a warm cache, the summary written out), `post` the
+// cold start after it (the smaller context written to the cache), `warm` / `cold` the same without it.
+type CompactCost = { now: number; post: number; postWarm: number; postTokens: number; warm: number; cold: number }
+
+const compactCost = (id: string | null, ctx: number, ttl: '1h' | '5m', l: Learned): CompactCost => {
+  const writeMult = ttl === '5m' ? 1.25 : 2
+  const r = rateOf(id, ctx)
+  const postTokens = Math.min(l.after ?? COMPACT_AFTER, ctx)
+  const pr = rateOf(id, postTokens)
+  return {
+    now: (ctx * r.read + (l.out ?? COMPACT_OUT) * r.input * OUTPUT_MULT) / 1e6,
+    post: (postTokens * pr.input * writeMult) / 1e6,
+    postWarm: (postTokens * pr.read) / 1e6,
+    postTokens,
+    warm: (ctx * r.read) / 1e6,
+    cold: (ctx * r.input * writeMult) / 1e6,
+  }
+}
+
+// What the mod makes of compacting this session now. `offer`: the cache cools soon and nothing
+// keeps it, so the band offers it (and auto-compact acts from `autoAt`); `later`: worth it, offered
+// from `at`; `covered`: the warmer keeps the cache, and warming beats compacting for a break up to
+// `breakEvenMs`; `cheap`: a cold start costs too little to bother.
+type CompactStatus =
+  | { kind: 'running' }
+  | { kind: 'small' }
+  | { kind: 'cold' }
+  | { kind: 'cheap' }
+  | { kind: 'covered'; breakEvenMs: number }
+  | { kind: 'later'; at: number }
+  | { kind: 'offer'; left: number; autoAt: number }
+
+const compactStatus = (s: Settings, c: Compaction, cacheAt: number | null, now: number, ctx: number, cost: CompactCost, w: WarmStatus, warmLeft: number): CompactStatus => {
+  if (c.state === 'running') return { kind: 'running' }
+  if (ctx <= 0 || ctx < 2 * cost.postTokens) return { kind: 'small' }
+  const ttlMs = ttlMsOf(s)
+  if (cacheAt === null || now >= cacheAt + ttlMs) return { kind: 'cold' }
+  if (cost.cold < s.compactMin || cost.now + cost.post > cost.cold * COMPACT_GAIN) return { kind: 'cheap' }
+  const end = cacheAt + ttlMs
+  // The cache stays warm until `end`; the warmer pays one whole context read `lead` before each
+  // cooling, and each read keeps it a TTL less that lead longer. Warming beats compacting for a
+  // break that ends before the first warm-up compacting would not pay for; past the last warm-up
+  // the cache cools all the same.
+  if (w.kind === 'armed') {
+    const lead = warmLeadMs(s)
+    const step = ttlMs - lead
+    const paid = Math.floor((cost.now + cost.post) / Math.max(cost.warm, 1e-9))
+    const breakEven = paid >= warmLeft ? end - now + warmLeft * step : end - lead - now + paid * step
+    return { kind: 'covered', breakEvenMs: Math.max(0, breakEven) }
+  }
+  // The offer comes at most `compactAt` minutes ahead, and never earlier than 40 % of the TTL.
+  const from = s.compactAt === 0 ? Infinity : end - Math.min(s.compactAt * 60_000, ttlMs * 0.4)
+  if (now < from) return { kind: 'later', at: from }
+  return { kind: 'offer', left: end - now, autoAt: end - warmLeadMs(s) }
 }
 
 const usd = (n: number): string => `$${n < 0.1 ? n.toFixed(3) : n.toFixed(2)}`
@@ -207,7 +325,13 @@ const save = async (
   figures: { rateLimits: readonly SessionRateLimit[]; context: SessionContextUsage; cost?: SessionCost },
 ) => {
   await update($, limits, () => figures.rateLimits.map(r => ({ kind: r.kind, percentUsed: r.percentUsed, resetsAt: r.resetsAt })))
-  await update($, context, () => ({ tokens: figures.context.tokens, window: figures.context.window, percent: figures.context.percent }))
+  // Right after a compaction the engine has no count until the next response: the mod keeps its own.
+  const compacted = ((await read($, compaction)) as Compaction).state === 'done'
+  await update($, context, prev =>
+    figures.context.tokens === undefined && compacted && prev?.tokens !== undefined
+      ? { ...prev, window: figures.context.window }
+      : { tokens: figures.context.tokens, window: figures.context.window, percent: figures.context.percent },
+  )
   await update($, costUsd, () => figures.cost?.usd ?? null)
 }
 
@@ -222,7 +346,13 @@ const valueOf = (s: Settings, key: SettingKey): unknown =>
           ? s.warnAt
           : key === 'money.budget'
             ? s.budget
-            : s.show[key.slice('show.'.length) as keyof Blocks]
+            : key === 'compact.at'
+              ? s.compactAt
+              : key === 'compact.min'
+                ? s.compactMin
+                : key === 'compact.auto'
+                  ? s.compactAuto
+                  : s.show[key.slice('show.'.length) as keyof Blocks]
 
 const why = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
@@ -232,7 +362,7 @@ async function loadSettings($: EngineInterface, ttl: '1h' | '5m'): Promise<Setti
   try {
     const keys = new Set(await $.store.keys())
     const legacy = keys.has(LEGACY_KEY) ? await $.store.get(LEGACY_KEY) : undefined
-    const raw: { lang?: unknown; ttl?: unknown; warmMax?: unknown; warnAt?: unknown; budget?: unknown; show: Record<string, unknown> } = {
+    const raw: Record<string, unknown> & { show: Record<string, unknown> } = {
       ...(legacy && typeof legacy === 'object' ? (legacy as object) : {}),
       show: { ...((legacy as { show?: object } | undefined)?.show ?? {}) },
     }
@@ -241,6 +371,9 @@ async function loadSettings($: EngineInterface, ttl: '1h' | '5m'): Promise<Setti
     if (keys.has('warm.max')) raw.warmMax = await $.store.get('warm.max')
     if (keys.has('warn.at')) raw.warnAt = await $.store.get('warn.at')
     if (keys.has('money.budget')) raw.budget = await $.store.get('money.budget')
+    if (keys.has('compact.at')) raw.compactAt = await $.store.get('compact.at')
+    if (keys.has('compact.min')) raw.compactMin = await $.store.get('compact.min')
+    if (keys.has('compact.auto')) raw.compactAuto = await $.store.get('compact.auto')
     for (const block of Object.keys(defaults(ttl).show)) {
       if (keys.has(`show.${block}`)) raw.show[block] = await $.store.get(`show.${block}`)
     }
@@ -304,14 +437,15 @@ let warming = false
 
 // Sends the warmer's prompt once the session is idle and its next warm-up is due.
 async function maybeWarm($: EngineInterface) {
-  if (busy || warming) return
+  if (busy || warming || compacting) return
   const cfg = (await read($, settings)) as Settings | null
   if (!cfg) return
   const now = await $.clock.now()
   const w = (await read($, warm)) as Warm
   const cacheAt = cacheFrom(await read($, lastReplyAt), await read($, replyModel), await read($, model))
-  const status = warmStatus(cfg, w, cacheAt, now, (await read($, context))?.tokens ?? 0, await read($, limits))
-  if (status.kind !== 'armed' || now < status.at) return
+  const status = warmStatus(cfg, w, cacheAt, now, (await read($, context))?.tokens ?? 0, await readRows($, now))
+  // A compaction may have started while this was reading: it goes first.
+  if (status.kind !== 'armed' || now < status.at || compacting) return
 
   warming = true
   let n = w.done + 1
@@ -329,11 +463,225 @@ async function maybeWarm($: EngineInterface) {
   }
 }
 
-// The timer's work: a fresh model, a redraw for the countdowns, the warmer and paid usage.
+// A compaction this mod started is running (module state, like `busy`). After a compaction whose size
+// the engine did not give, the reply to the next turn teaches the mod how large the context then is:
+// 'armed' until that turn starts ('next'), so the compacting turn's own end is never taken for it.
+let compacting = false
+let learnAfter: 'no' | 'armed' | 'next' = 'no'
+// The engine's own compaction, when this mod's /compact command raised it and the mod's hook heard it:
+// its sizes, or the veto another hook gave it.
+let heard: SessionCompactResult | null = null
+// A session outside the terminal REPL (the desktop app is an SDK session) cannot take
+// $.session.compact(): set at session start, or once the call said so; then compactions go straight to /compact.
+let viaCommand = false
+
+async function compactNow($: EngineInterface): Promise<{ cfg: Settings; status: CompactStatus; cost: CompactCost; cacheAt: number | null }> {
+  const cfg: Settings = ((await read($, settings)) as Settings | null) ?? defaults('1h')
+  const now = await $.clock.now()
+  const modelId = await read($, model)
+  const cacheAt = cacheFrom(await read($, lastReplyAt), await read($, replyModel), modelId)
+  const ctx = (await read($, context))?.tokens ?? 0
+  const cost = compactCost(modelId, ctx, cfg.ttl, (await read($, learned)) as Learned)
+  const w = warmStatus(cfg, (await read($, warm)) as Warm, cacheAt, now, ctx, await readRows($, now))
+  const left = cfg.warmMax - ((await read($, warm)) as Warm).done
+  return { cfg, status: compactStatus(cfg, (await read($, compaction)) as Compaction, cacheAt, now, ctx, cost, w, left), cost, cacheAt }
+}
+
+// A compaction stood (this mod's, the person's /compact or the engine's own): the context is
+// the summary now, the summarizer has just read the cache, and its sizes are worth keeping.
+async function compacted($: EngineInterface, result: Omit<SessionCompacted, 'messages'>, auto: boolean, before: number | null, estimate: number) {
+  const now = await $.clock.now()
+  const after = result.tokensAfter ?? estimate
+  const was = result.tokensBefore ?? before
+  await update($, compaction, (c): Compaction => ({ ...(c as Compaction), state: 'done', at: now, before: was, after, reason: null, auto }))
+  await update($, context, c => (c ? { ...c, tokens: after, percent: c.window ? (after / c.window) * 100 : c.percent } : c))
+  await update($, lastReplyAt, () => now)
+  // The summarizer ran on the session's model: its cache serves that model only.
+  const id = await $.session.model()
+  await update($, replyModel, () => id)
+  const real = result.tokensAfter
+  if (typeof real === 'number' && Number.isFinite(real) && real > 0) {
+    learnAfter = 'no'
+    await keepAfter($, real)
+  } else {
+    learnAfter = 'armed'
+  }
+  const out = result.usage?.output_tokens
+  if (typeof out === 'number' && out > 0) {
+    await update($, learned, l => ({ ...(l as Learned), out }))
+    try {
+      await $.store.set(STORE_OUT, out)
+    } catch {
+      // Without a store the length holds for this session.
+    }
+  }
+  const cfg = (await read($, settings)) as Settings | null
+  if (auto) $.ui.toast(TEXT[cfg?.lang ?? 'uk'].compactToastAuto(was === null ? '?' : tokens(was), tokens(after)))
+}
+
+// Compacts the session (the button, or auto-compact): never on top of a running turn, a warm-up
+// on its way or another compaction. A veto or a rejection is told in the details and a toast.
+// `seen` (auto-compact only): the «не зараз» count when it decided; a press since stops it.
+async function runCompact($: EngineInterface, auto: boolean, seen = dismissals) {
+  // The flags are checked and set before the first await: two quick presses start one compaction.
+  if (compacting) return
+  if (busy || warming) {
+    if (!auto) $.ui.toast(TEXT[(((await read($, settings)) as Settings | null) ?? defaults('1h')).lang].compactBusy)
+    return
+  }
+  compacting = true
+  try {
+    const { cfg, cost, cacheAt } = await compactNow($)
+    const t: Strings = TEXT[cfg.lang]
+    const now = await $.clock.now()
+    const before = (await read($, context))?.tokens ?? null
+    const prev = (await read($, compaction)) as Compaction
+    await update($, compaction, (c): Compaction => ({ ...(c as Compaction), state: 'running', at: now, before, after: null, reason: null, auto, autoFor: auto ? cacheAt : (c as Compaction).autoFor }))
+    if (!(await compactRun($, t, auto, before, cost.postTokens, () => busy || warming || (auto && dismissals !== seen)))) {
+      // A turn began, or «не зараз» came, while this was getting ready: nothing ran, the details
+      // stay as they were (but for a «не зараз» given meanwhile).
+      await update($, compaction, (c): Compaction => ({ ...prev, dismissedFor: (c as Compaction).dismissedFor }))
+      if (!auto) $.ui.toast(t.compactBusy)
+    }
+  } finally {
+    compacting = false
+  }
+}
+
+// In a terminal session the engine compacts on $.session.compact(). The desktop app (an SDK
+// session) refuses that call: there compaction runs inside a turn, as the /compact command,
+// which $.command.run raises as the person's own (probed 15.11.2026, Claude Code 2.1.321).
+// False when `stop` held right before the call (a turn began, or «не зараз» stopped an auto-compaction):
+// then nothing ran. The check sits right before each call, with no await between them.
+async function compactRun($: EngineInterface, t: Strings, auto: boolean, before: number | null, estimate: number, stop: () => boolean): Promise<boolean> {
+  if (!viaCommand) {
+    if (stop()) return false
+    try {
+      const result = await $.session.compact()
+      if (result.skip !== undefined) await compactFailed($, t, result.skip)
+      else await compacted($, result, auto, before, estimate)
+      return true
+    } catch (err) {
+      // Only «not available in a headless (-p / SDK) session» leaves /compact as the way;
+      // any other refusal (a turn running, an engine error) is the person's to know.
+      if (!/headless|SDK/.test(why(err))) {
+        await compactFailed($, t, why(err))
+        return true
+      }
+      viaCommand = true
+    }
+  }
+  if (stop()) return false
+  heard = null
+  try {
+    const out = await $.command.run({ command: 'compact' })
+    const got = heard as SessionCompactResult | null
+    // A hook vetoed the engine's compaction: the command may still print nothing.
+    if (got?.skip !== undefined) await compactFailed($, t, got.skip)
+    else {
+      // Success prints nothing (the desktop app) or «Compacted…»; anything else is the reason it did not.
+      const text = out.text?.trim()
+      if (text && !/compacted/i.test(text)) await compactFailed($, t, text)
+      else await compacted($, got ?? {}, auto, before, estimate)
+    }
+  } catch (err) {
+    await compactFailed($, t, why(err))
+  } finally {
+    heard = null
+  }
+  return true
+}
+
+async function compactFailed($: EngineInterface, t: Strings, reason: string) {
+  await update($, compaction, (c): Compaction => ({ ...(c as Compaction), state: 'failed', reason }))
+  $.ui.toast(t.compactToastFailed(reason))
+}
+
+// «не зараз»: the offer stays hidden, and auto-compact keeps still, until the next reply.
+// The count goes up before any await: an auto-compaction getting ready sees it right before its call.
+let dismissals = 0
+async function dismissCompact($: EngineInterface, cacheAt: number | null) {
+  dismissals++
+  await update($, compaction, (c): Compaction => ({ ...(c as Compaction), dismissedFor: cacheAt }))
+}
+
+// Auto-compact, when the person turned it on: the cache is about to cool, nothing keeps it warm,
+// the session is idle, and this cache has not been compacted or the offer dismissed already.
+async function maybeCompact($: EngineInterface) {
+  if (busy || warming || compacting) return
+  const seen = dismissals
+  const { cfg, status, cacheAt } = await compactNow($)
+  if (!cfg.compactAuto || status.kind !== 'offer' || cacheAt === null) return
+  const c = (await read($, compaction)) as Compaction
+  if (c.autoFor === cacheAt || c.dismissedFor === cacheAt) return
+  if ((await $.clock.now()) < status.autoAt) return
+  await runCompact($, true, seen)
+}
+
+// The first reply to a turn begun after a compaction says how large the compacted context is,
+// however large: kept for the estimates of later compactions on this computer.
+async function learnSize($: EngineInterface) {
+  if (learnAfter !== 'next') return
+  const size = (await $.session.usage()).context.tokens
+  // No count yet: the next reply tells it.
+  if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) return
+  learnAfter = 'no'
+  await keepAfter($, size)
+}
+
+// The size a compacted context really had, large or small: a large one rightly makes later offers rarer.
+async function keepAfter($: EngineInterface, size: number) {
+  await update($, learned, l => ({ ...(l as Learned), after: size }))
+  try {
+    await $.store.set(STORE_AFTER, size)
+  } catch {
+    // Without a store the size holds for this session.
+  }
+}
+
+async function loadLearned($: EngineInterface) {
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null)
+  try {
+    const after = num(await $.store.get(STORE_AFTER))
+    const out = num(await $.store.get(STORE_OUT))
+    await update($, learned, () => ({ after, out }))
+  } catch {
+    // The estimates stay the built-in ones.
+  }
+}
+
+// The person's /compact or the engine's own at its threshold: the band follows them too.
+// (This mod's own compaction is handled where it is called: $.session.compact() skips this hook,
+// and a /compact it runs is passed through here with its sizes kept for compactRun.)
+async function watchCompact($: EngineInterface, e: SessionCompactInput, next: (e: SessionCompactInput) => Promise<SessionCompactResult>) {
+  if (e.agentId || (e.trigger !== 'manual' && e.trigger !== 'auto')) return next(e)
+  if (compacting) {
+    // This mod's own /compact: compactRun records it, with the engine's real sizes.
+    const result = await next(e)
+    heard = result
+    return result
+  }
+  const before = (await read($, context))?.tokens ?? null
+  const prev = (await read($, compaction)) as Compaction
+  await update($, compaction, (c): Compaction => ({ ...(c as Compaction), state: 'running', at: null, before, after: null, reason: null, auto: false }))
+  let result: SessionCompactResult
+  try {
+    result = await next(e)
+  } catch (err) {
+    await update($, compaction, () => prev)
+    throw err
+  }
+  if (result.skip !== undefined) await update($, compaction, () => prev)
+  else await compacted($, result, false, before, (await compactNow($)).cost.postTokens)
+  return result
+}
+
+// The timer's work: a fresh model, a redraw for the countdowns, the warmer, compacting and paid usage.
 async function onTick($: EngineInterface) {
   await refreshModel($)
   await update($, tick, n => n + 1)
   await maybeWarm($)
+  await maybeCompact($)
   await refreshExtra($)
   await checkWarnings($)
 }
@@ -532,7 +880,7 @@ async function checkWarnings($: EngineInterface) {
   const p = await read($, plan)
   const x = (await read($, extra)) as Extra | null
 
-  for (const r of await read($, limits)) {
+  for (const r of await readRows($, now)) {
     const level = windowLevel(cfg.warnAt, r.percentUsed)
     if (level === 0) continue
     const resetAt = r.resetsAt ? Date.parse(r.resetsAt) : NaN
@@ -580,6 +928,7 @@ export const register: Register = (on, options) => {
   // A TTL picked in ⚙ (the store's 'ttl') still wins over the one the login gives.
   on('session.start', async ($, e, next) => {
     $.clock.every(30_000, () => void onTick($))
+    viaCommand = e.surface !== 'terminal'
     const signedIn = await detectPlan($)
     await update($, plan, () => signedIn)
     defaultTtl = loginTtl(signedIn, configuredTtl)
@@ -591,6 +940,7 @@ export const register: Register = (on, options) => {
     // The cost so far was counted before a reload or belongs to an earlier run.
     lastCost = usage.cost?.usd ?? null
     if (signedIn === 'api-key') await loadSpend($)
+    await loadLearned($)
     await refreshModel($)
     usageReadAt = 0
     await refreshExtra($)
@@ -618,13 +968,17 @@ export const register: Register = (on, options) => {
     if (!e.agentId && e.usage) {
       await touch($, e.usage.model)
       await refreshModel($)
+      await learnSize($)
     }
 
     return next(e)
   })
 
   on('turn.start', async ($, e, next) => {
-    if (!e.agentId) busy = true
+    if (!e.agentId) {
+      busy = true
+      if (learnAfter === 'armed') learnAfter = 'next'
+    }
 
     return next(e)
   })
@@ -637,6 +991,8 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  on('session.compact', ($, e, next) => watchCompact($, e, next))
+
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) {
       return next(e)
@@ -646,10 +1002,10 @@ export const register: Register = (on, options) => {
     const cfg: Settings = ((await read($, settings)) as Settings | null) ?? defaults(defaultTtl)
     const t: Strings = TEXT[cfg.lang]
     const show: Blocks = cfg.show
-    const rows = await read($, limits)
+    const now = await $.clock.now()
+    const rows = await readRows($, now)
     const replyAt = await read($, lastReplyAt)
     const mode = await read($, view)
-    const now = await $.clock.now()
     const { Box, Button, Text } = $.ui.resolve(e)
     const ttlMs = ttlMsOf(cfg)
 
@@ -659,6 +1015,9 @@ export const register: Register = (on, options) => {
     const w = (await read($, warm)) as Warm
     const cacheAt = cacheFrom(replyAt, await read($, replyModel), modelId)
     const warmNow = warmStatus(cfg, w, cacheAt, now, ctxTokens, rows)
+    const comp = (await read($, compaction)) as Compaction
+    const cc = compactCost(modelId, ctxTokens, cfg.ttl, (await read($, learned)) as Learned)
+    const compactNowStatus = compactStatus(cfg, comp, cacheAt, now, ctxTokens, cc, warmNow, cfg.warmMax - w.done)
 
     const cacheLeft = cacheAt === null ? 0 : cacheAt + ttlMs - now
     const isWarm = cacheLeft > 0
@@ -807,8 +1166,43 @@ export const register: Register = (on, options) => {
       </Box>
     )
 
+    // The offer to compact: the cache cools soon, nothing keeps it warm, and a cold start would cost
+    // far more than compacting now. A second row, only while it stands; «не зараз» hides it for this cache.
+    const compactRow = (() => {
+      if (compactNowStatus.kind === 'running') {
+        return (
+          <Box flexDirection="row" alignItems="center" columnGap={1}>
+            <Text color="#f07a1a" weight="semibold">{t.compactRunning}</Text>
+          </Box>
+        )
+      }
+      if (compactNowStatus.kind !== 'offer' || comp.dismissedFor === cacheAt || e.props.isWorking) return null
+      const left = span(compactNowStatus.left, t)
+      const autoText = cfg.compactAuto ? t.compactAutoAt(clockTime(compactNowStatus.autoAt, t)) : null
+      const buttons = t.compactButton.length + 2 + 1 + t.compactDismiss.length + 2
+      const texts = [t.compactAlert(left, usd(cc.now), usd(cc.post), usd(cc.cold)), t.compactAlertShort(left, usd(cc.now), usd(cc.cold)), t.compactAlertMin(left)]
+      const text = texts.find(x => x.length + 1 + buttons + (autoText ? 1 + autoText.length : 0) <= e.props.bodyColumns) ?? texts[texts.length - 1]!
+      const withAuto = autoText !== null && text.length + 1 + buttons + 1 + autoText.length <= e.props.bodyColumns
+      return (
+        <Box flexDirection="row" alignItems="center" columnGap={1} rowGap={0} flexWrap="wrap">
+          <Text color="#f07a1a" weight="semibold" tabular>{text}</Text>
+          {withAuto ? <Text dimColor tabular>{autoText}</Text> : null}
+          <Button key="compact-band" label={t.compactButton} onPress={() => void runCompact($, false)} />
+          <Button key="compact-dismiss" plain dimColor label={t.compactDismiss} onPress={() => void dismissCompact($, cacheAt)} />
+        </Box>
+      )
+    })()
+    const head = compactRow ? (
+      <Box flexDirection="column">
+        {line}
+        {compactRow}
+      </Box>
+    ) : (
+      line
+    )
+
     if (mode === 'closed') {
-      return line
+      return head
     }
 
     if (mode === 'settings') {
@@ -833,7 +1227,7 @@ export const register: Register = (on, options) => {
 
       return (
         <Box flexDirection="column">
-          {line}
+          {head}
           <Box flexDirection="row" alignItems="center" columnGap={2}>
             <Button key="open-details" plain dimColor label={t.backToDetails} onPress={() => void update($, view, () => 'details')} />
             <Text weight="semibold" size="footnote">{t.settingsTitle}</Text>
@@ -843,6 +1237,12 @@ export const register: Register = (on, options) => {
           {row(t.warmRow, WARM_CHOICES.map(n => choice(`warm-${n}`, n === 0 ? t.warmChoiceOff : String(n), cfg.warmMax === n, () => void change($, defaultTtl, 'warm.max', s => ({ ...s, warmMax: n })))))}
           {row(t.warnRow, WARN_CHOICES.map(n => choice(`warn-${n}`, n === 0 ? t.warmChoiceOff : `${n}%`, cfg.warnAt === n, () => void change($, defaultTtl, 'warn.at', s => ({ ...s, warnAt: n })))))}
           {row(t.budgetRow, BUDGET_CHOICES.map(n => choice(`budget-${n}`, n === 0 ? t.budgetNone : `$${n}`, cfg.budget === n, () => void change($, defaultTtl, 'money.budget', s => ({ ...s, budget: n })))))}
+          {row(t.compactAtRow, [
+            ...COMPACT_AT_CHOICES.map(n => choice(`compact-at-${n}`, n === 0 ? t.warmChoiceOff : t.minutes(n), cfg.compactAt === n, () => void change($, defaultTtl, 'compact.at', s => ({ ...s, compactAt: n })))),
+            <Text key="compact-min-label" dimColor size="footnote">{`${t.compactMinRow}:`}</Text>,
+            ...COMPACT_MIN_CHOICES.map(n => choice(`compact-min-${n}`, `$${n}`, cfg.compactMin === n, () => void change($, defaultTtl, 'compact.min', s => ({ ...s, compactMin: n })))),
+          ])}
+          {row(t.compactAutoRow, ([false, true] as const).map(v => choice(`compact-auto-${v ? 'on' : 'off'}`, v ? t.compactAutoOn : t.warmChoiceOff, cfg.compactAuto === v, () => void change($, defaultTtl, 'compact.auto', s => ({ ...s, compactAuto: v })))))}
           {row(t.bandRow, BAND_BLOCKS.map(check))}
           {row(t.detailsRow, DETAIL_BLOCKS.map(check))}
         </Box>
@@ -881,7 +1281,9 @@ export const register: Register = (on, options) => {
       const resetAt = limit.resetsAt ? Date.parse(limit.resetsAt) : NaN
       const facts: Fact[] = [{ text: t.used(used), color: tone(100 - used) }]
 
-      if (Number.isFinite(resetAt)) {
+      if (limit.renewedAt !== undefined) {
+        facts.push({ text: t.renewed(clockTime(limit.renewedAt, t, now - limit.renewedAt >= 24 * 3_600_000)) })
+      } else if (Number.isFinite(resetAt)) {
         // Within a day «через …» says which day it is, so the time is enough.
         facts.push({ text: t.reset(clockTime(resetAt, t, resetAt - now >= 24 * 3_600_000), span(resetAt - now, t)) })
         const elapsed = window ? (now - (resetAt - window.ms)) / window.ms : NaN
@@ -922,6 +1324,49 @@ export const register: Register = (on, options) => {
                       { text: t.warmCost(usd(warmUsd), usd(coldUsd)) },
                     ]
     const toggleWarm = () => void update($, warm, s => ({ ...s, paused: !(s as Warm).paused }))
+
+    // Compacting: what it costs now, what a cold start costs after it, and which of it and the warmer pays.
+    const whyCompact = (): string =>
+      warmNow.kind === 'off'
+        ? t.compactWhy.off
+        : warmNow.kind === 'paused'
+          ? t.compactWhy.paused
+          : warmNow.kind === 'spent'
+            ? t.compactWhy.spent
+            : warmNow.kind === 'limits'
+              ? t.compactWhy.limits(t[warmNow.window].short)
+              : t.compactWhy.cold
+    const compactCosts: Fact[] = [
+      { text: t.compactNow(usd(cc.now)), strong: true },
+      { text: t.compactThen(usd(cc.post), usd(cc.cold)), color: '#f07a1a' },
+      { text: t.compactPerTurn(usd(cc.postWarm), usd(cc.warm)) },
+    ]
+    const k = compactNowStatus.kind
+    const compactFacts: Fact[] = [
+      ...(comp.state === 'failed' && comp.reason ? [{ text: t.compactFailed(comp.reason), color: '#e5484d' }] : []),
+      ...(k === 'running'
+        ? [{ text: t.compactRunning, color: '#f07a1a' }]
+        : k === 'small'
+          ? comp.state === 'done' && comp.at !== null && comp.after !== null
+            ? [
+                { text: t.compactDone(clockTime(comp.at, t), comp.before === null ? '?' : tokens(comp.before), tokens(comp.after)), strong: true },
+                { text: t.compactDoneNote },
+              ]
+            : [{ text: t.compactSmall }]
+          : k === 'cold'
+            ? [{ text: t.compactCold }]
+            : k === 'cheap'
+              ? [{ text: t.compactNotWorth(usd(cc.cold)) }]
+              : k === 'covered'
+                ? [...compactCosts, { text: t.compactBetterWarm(span(compactNowStatus.breakEvenMs, t)) }, { text: t.compactNote }]
+                : [
+                    ...compactCosts,
+                    { text: t.compactBetter(whyCompact()), color: '#e5484d' },
+                    ...(k === 'offer' && cfg.compactAuto ? [{ text: t.compactAutoAt(clockTime(compactNowStatus.autoAt, t)) }] : []),
+                    { text: t.compactNote },
+                  ]),
+    ]
+    const canCompact = (k === 'offer' || k === 'later' || k === 'covered') && !e.props.isWorking
 
     // Paid usage: a subscription's extra usage (on or off) or an API key's month.
     const moneyFacts: Fact[] | null = !paid
@@ -976,19 +1421,21 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column">
-        {line}
+        {head}
         {limitRow('seven_day')}
         {limitRow('five_hour')}
         {otherKinds.map(limitRow)}
         {show.money && moneyFacts ? detail('money', t.rowsMoney, moneyFacts) : null}
         {detail('cache', t.rows.cache, cacheFacts)}
         {detail('warm', t.rows.warm, warmFacts)}
+        {ctxTokens > 0 || comp.state !== 'idle' ? detail('compact', t.rows.compact, compactFacts) : null}
         {show.priceDetails && ctxTokens > 0 ? detail('price', t.rows.price, priceFacts) : null}
         {show.models && ctxTokens > 0 ? detail('models', t.rows.models, modelFacts) : null}
         {show.session ? detail('session', t.rows.session, sessionFacts) : null}
         <Box flexDirection="row" alignItems="center" columnGap={2}>
           <Button key="open-settings" plain dimColor label={t.openSettings} onPress={() => void update($, view, () => 'settings')} />
           {cfg.warmMax > 0 ? <Button key="warm-pause" plain dimColor label={w.paused ? t.warmResume : t.warmPause} onPress={toggleWarm} /> : null}
+          {canCompact ? <Button key="compact-now" plain label={t.compactButton} onPress={() => void runCompact($, false)} /> : null}
         </Box>
       </Box>
     )

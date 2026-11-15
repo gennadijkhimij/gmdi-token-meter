@@ -6,7 +6,7 @@
     {
       "name": "gmdi-token-meter",
       "source": "./",
-      "description": "Usage band above the Claude Code prompt: 7D/5H limits, prompt-cache warm/cold timer, cost to resume, cache warmer."
+      "description": "Usage band above the Claude Code prompt: 7D/5H limits, prompt-cache warm/cold timer, cost to resume, cache warmer, compact-while-warm offer and optional auto-compact."
     }
   ]
 }
