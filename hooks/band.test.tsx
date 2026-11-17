@@ -45,7 +45,7 @@ const storeIn = (on: On, saved: Record<string, unknown>) => {
 
 // The engine beneath the plugin for one session: its clock, usage figures and model.
 // The prompts the plugin submits (the warmer's) land in `sent`.
-const session = (on: On, usage: { tokens?: number; limits?: typeof LIMITS; sent?: string[]; model?: string }) => {
+const session = (on: On, usage: { tokens?: number; limits?: typeof LIMITS; sent?: string[]; model?: string; breakdown?: object }) => {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('prompt.submit', (_, e) => {
@@ -53,8 +53,12 @@ const session = (on: On, usage: { tokens?: number; limits?: typeof LIMITS; sent?
     return { text: e.text }
   })
   on('session.model', () => ({ value: usage.model ?? 'claude-opus-5-5' }))
-  on('session.usage', () => ({
-    value: { startedAt: NOW, context: { tokens: usage.tokens, window: 1_000_000 }, rateLimits: usage.limits ?? [] },
+  on('session.usage', (_, e) => ({
+    value: {
+      startedAt: NOW,
+      context: { tokens: usage.tokens, window: 1_000_000, ...(e?.breakdown && usage.breakdown ? { breakdown: usage.breakdown as never } : {}) },
+      rateLimits: usage.limits ?? [],
+    },
   }))
   on('turn.complete', () => ({ text: 'ok' }))
 }
@@ -1502,5 +1506,666 @@ test('«не зараз» pressed while an auto-compaction gets ready stops it b
   // Nothing more on its own for this cache.
   await clock.advance(60_000)
   expect(calls).toEqual([])
+  await band.unmount()
+})
+
+// The engine's auto-compact window: /autocompact beneath the plugin, its context breakdown.
+const autocompact = (on: On, calls: string[], answer: (args: string) => string) =>
+  on('command.run', { command: 'autocompact' }, (_, e) => {
+    calls.push(String(e.args))
+    return { text: answer(String(e.args)) } as never
+  })
+const SET = (args: string) => `Auto-compact window for claude-opus-5-5 set to ${args} tokens`
+const breakdownAt = (window: number, source = 'settings', enabled = true) => ({
+  categories: [],
+  totalTokens: 0,
+  rawMaxTokens: window,
+  maxTokens: window,
+  percentage: 0,
+  model: 'claude-opus-5-5',
+  autocompactSource: source,
+  autoCompactThreshold: window - 33_000,
+  isAutoCompactEnabled: enabled,
+})
+
+test('⚙ sets the auto-compact window with /autocompact at once, and a refusal is told without a record', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  storeIn(on, saved)
+  const usage = { tokens: 120_000, breakdown: breakdownAt(1_000_000, 'model-default') as object }
+  session(on, usage)
+  const toasts: string[] = []
+  toastsIn(on, toasts)
+  const calls: string[] = []
+  let refuse = false
+  autocompact(on, calls, args => (refuse ? 'CLAUDE_CODE_AUTO_COMPACT_WINDOW takes precedence' : SET(args)))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  await band.press({ key: 'open-settings' })
+  expect((await band.find({ type: 'Text', text: /^Поріг автостиснення:$/ }))?.text).toBe('Поріг автостиснення:')
+
+  usage.breakdown = breakdownAt(200_000)
+  await band.press({ key: 'window-200000' })
+  expect(calls).toEqual(['200000'])
+  expect(toasts).toContain('Поріг автостиснення: Auto-compact window for claude-opus-5-5 set to 200000 tokens')
+  expect(saved['compact.window']).toBe(200_000)
+  expect(saved['compact.window.model.claude-opus-5-5']).toBe(200_000)
+
+  // «як у рушія» hands the window back to the engine and forgets the record.
+  await band.press({ key: 'window-0' })
+  expect(calls).toEqual(['200000', 'auto'])
+  expect(saved['compact.window']).toBe(0)
+  expect(saved['compact.window.model.claude-opus-5-5']).toBe(0)
+
+  // A refusal is told and changes nothing: neither the pick nor the record.
+  refuse = true
+  await band.press({ key: 'window-300000' })
+  expect(calls).toEqual(['200000', 'auto', '300000'])
+  expect(toasts).toContain('Поріг автостиснення не змінено: CLAUDE_CODE_AUTO_COMPACT_WINDOW takes precedence')
+  expect(saved['compact.window']).toBe(0)
+  expect(saved['compact.window.model.claude-opus-5-5']).toBe(0)
+  await band.unmount()
+})
+
+test('a window picked in another session is set here by the timer, once per model, not while a turn runs', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = { 'compact.window': 400_000 }
+  storeIn(on, saved)
+  session(on, { tokens: 120_000 })
+  const calls: string[] = []
+  autocompact(on, calls, SET)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'працюй', turnId: 'p1' })
+  await clock.advance(31_000)
+  expect(calls).toEqual([])
+  await $.turn.complete({ ...ANSWERED, turnId: 'p1' })
+  await clock.advance(30_000)
+  expect(calls).toEqual(['400000'])
+  expect(saved['compact.window.model.claude-opus-5-5']).toBe(400_000)
+  await clock.advance(5 * 60_000)
+  expect(calls).toEqual(['400000'])
+})
+
+test('a session started before another one picked a window takes the new pick, not its own old one', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  storeIn(on, saved)
+  session(on, { tokens: 120_000 })
+  const calls: string[] = []
+  autocompact(on, calls, SET)
+
+  // This session starts with «як у рушія»; another one then sets 400k for the same model.
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  saved['compact.window'] = 400_000
+  saved['compact.window.model.claude-opus-5-5'] = 400_000
+  await clock.advance(31_000)
+  expect(calls).toEqual([])
+  expect(saved['compact.window.model.claude-opus-5-5']).toBe(400_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  await band.press({ key: 'open-settings' })
+  expect((await band.find({ type: 'Text', text: /^Поріг автостиснення:$/ }))?.text).toBe('Поріг автостиснення:')
+  await band.unmount()
+})
+
+test('a pick the session cannot set while busy waits for the timer, and is saved only once the engine took it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  storeIn(on, saved)
+  session(on, { tokens: 120_000 })
+  const toasts: string[] = []
+  toastsIn(on, toasts)
+  const calls: string[] = []
+  autocompact(on, calls, SET)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  await band.press({ key: 'open-settings' })
+  await $.turn.start({ text: 'працюй', turnId: 'p1' })
+  await band.press({ key: 'window-300000' })
+  expect(calls).toEqual([])
+  expect(toasts).toContain('Поріг застосую, щойно Claude закінчить відповідь')
+  expect(saved['compact.window']).toBeUndefined()
+  await $.turn.complete({ ...ANSWERED, turnId: 'p1' })
+  await clock.advance(31_000)
+  expect(calls).toEqual(['300000'])
+  expect(saved['compact.window']).toBe(300_000)
+  expect(saved['compact.window.model.claude-opus-5-5']).toBe(300_000)
+  await clock.advance(5 * 60_000)
+  expect(calls).toEqual(['300000'])
+  await band.unmount()
+})
+
+test('a pick left for the timer and then refused keeps the earlier pick, and is not tried again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = { 'compact.window': 200_000, 'compact.window.model.claude-opus-5-5': 200_000 }
+  storeIn(on, saved)
+  session(on, { tokens: 120_000 })
+  const toasts: string[] = []
+  toastsIn(on, toasts)
+  const calls: string[] = []
+  autocompact(on, calls, () => 'CLAUDE_CODE_AUTO_COMPACT_WINDOW takes precedence')
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  await band.press({ key: 'open-settings' })
+  await $.turn.start({ text: 'працюй', turnId: 'p1' })
+  await band.press({ key: 'window-300000' })
+  expect(calls).toEqual([])
+  await $.turn.complete({ ...ANSWERED, turnId: 'p1' })
+  await clock.advance(31_000)
+  expect(calls).toEqual(['300000'])
+  expect(toasts).toContain('Поріг автостиснення не змінено: CLAUDE_CODE_AUTO_COMPACT_WINDOW takes precedence')
+  expect(saved['compact.window']).toBe(200_000)
+  expect(saved['compact.window.model.claude-opus-5-5']).toBe(200_000)
+  await clock.advance(5 * 60_000)
+  expect(calls).toEqual(['300000'])
+  await band.unmount()
+})
+
+test('a pick left for the timer gives way to a newer pick from another session', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  storeIn(on, saved)
+  session(on, { tokens: 120_000 })
+  const calls: string[] = []
+  autocompact(on, calls, SET)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  await band.press({ key: 'open-settings' })
+  await $.turn.start({ text: 'працюй', turnId: 'p1' })
+  await band.press({ key: 'window-300000' })
+  // Another session, idle, sets 400k meanwhile.
+  saved['compact.window'] = 400_000
+  saved['compact.window.model.claude-opus-5-5'] = 400_000
+  await $.turn.complete({ ...ANSWERED, turnId: 'p1' })
+  await clock.advance(31_000)
+  await clock.advance(31_000)
+  expect(calls).toEqual([])
+  expect(saved['compact.window']).toBe(400_000)
+  expect(saved['compact.window.model.claude-opus-5-5']).toBe(400_000)
+  await band.unmount()
+})
+
+test('a pick left for the timer gives way to a pick another session made later, even one changed back', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = { 'compact.window': 200_000, 'compact.window.model.claude-opus-5-5': 200_000 }
+  storeIn(on, saved)
+  session(on, { tokens: 120_000 })
+  const calls: string[] = []
+  autocompact(on, calls, SET)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  await band.press({ key: 'open-settings' })
+  await $.turn.start({ text: 'працюй', turnId: 'p1' })
+  await band.press({ key: 'window-300000' })
+  // Another session picks 400k, then 200k again, after the press here.
+  await clock.advance(1_000)
+  saved['compact.window'] = 200_000
+  saved['compact.window.at'] = NOW + 1_000
+  await $.turn.complete({ ...ANSWERED, turnId: 'p1' })
+  await clock.advance(31_000)
+  await clock.advance(31_000)
+  expect(calls).toEqual([])
+  expect(saved['compact.window']).toBe(200_000)
+  await band.unmount()
+})
+
+test('a pick pressed while the timer sets an earlier one goes next, and is the one saved', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  storeIn(on, saved)
+  session(on, { tokens: 120_000 })
+  const calls: string[] = []
+  let pressDuring: (() => Promise<unknown>) | null = null
+  on('command.run', { command: 'autocompact' }, async (_, e) => {
+    calls.push(String(e.args))
+    const press = pressDuring
+    pressDuring = null
+    if (press) await press()
+    return { text: SET(String(e.args)) } as never
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  await band.press({ key: 'open-settings' })
+  await $.turn.start({ text: 'працюй', turnId: 'p1' })
+  await band.press({ key: 'window-300000' })
+  await $.turn.complete({ ...ANSWERED, turnId: 'p1' })
+  pressDuring = () => band.press({ key: 'window-400000' })
+  await clock.advance(31_000)
+  expect(calls).toEqual(['300000'])
+  expect(saved['compact.window']).toBeUndefined()
+  await clock.advance(31_000)
+  expect(calls).toEqual(['300000', '400000'])
+  expect(saved['compact.window']).toBe(400_000)
+  expect(saved['compact.window.model.claude-opus-5-5']).toBe(400_000)
+  await band.unmount()
+})
+
+test('a pick pressed while an earlier press is still being set goes next, and is the one saved', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  storeIn(on, saved)
+  session(on, { tokens: 120_000 })
+  const calls: string[] = []
+  let pressDuring: (() => Promise<unknown>) | null = null
+  on('command.run', { command: 'autocompact' }, async (_, e) => {
+    calls.push(String(e.args))
+    const press = pressDuring
+    pressDuring = null
+    if (press) await press()
+    return { text: SET(String(e.args)) } as never
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  await band.press({ key: 'open-settings' })
+  pressDuring = () => band.press({ key: 'window-400000' })
+  await band.press({ key: 'window-300000' })
+  expect(calls).toEqual(['300000'])
+  expect(saved['compact.window']).toBeUndefined()
+  await clock.advance(31_000)
+  expect(calls).toEqual(['300000', '400000'])
+  expect(saved['compact.window']).toBe(400_000)
+  expect(saved['compact.window.model.claude-opus-5-5']).toBe(400_000)
+  await clock.advance(31_000)
+  expect(calls).toEqual(['300000', '400000'])
+  await band.unmount()
+})
+
+test('a pick set here while another session saved a newer one is not saved over it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  storeIn(on, saved)
+  session(on, { tokens: 120_000 })
+  const calls: string[] = []
+  on('command.run', { command: 'autocompact' }, (_, e) => {
+    calls.push(String(e.args))
+    if (calls.length === 1) {
+      // Another session sets and saves 400k while this command runs.
+      saved['compact.window'] = 400_000
+      saved['compact.window.at'] = NOW + 1
+      saved['compact.window.model.claude-opus-5-5'] = 400_000
+    }
+    return { text: SET(String(e.args)) } as never
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  await band.press({ key: 'open-settings' })
+  await band.press({ key: 'window-300000' })
+  expect(saved['compact.window']).toBe(400_000)
+  // The engine now has 300k from here: the timer sets the saved 400k again.
+  await clock.advance(31_000)
+  expect(calls).toEqual(['300000', '400000'])
+  expect(saved['compact.window']).toBe(400_000)
+  expect(saved['compact.window.model.claude-opus-5-5']).toBe(400_000)
+  await band.unmount()
+})
+
+test('a pick pressed while an earlier one is being saved wins over it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  let pressDuring: (() => Promise<unknown>) | null = null
+  on('store.keys', () => ({ value: Object.keys(saved) }))
+  on('store.get', (_, e) => ({ value: saved[e.key] }))
+  on('store.set', async (_, e) => {
+    if (e.key === 'compact.window.at' && pressDuring) {
+      const press = pressDuring
+      pressDuring = null
+      await press()
+    }
+    saved[e.key] = e.value
+    return { value: undefined }
+  })
+  session(on, { tokens: 120_000 })
+  const calls: string[] = []
+  autocompact(on, calls, SET)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  await band.press({ key: 'open-settings' })
+  pressDuring = () => band.press({ key: 'window-400000' })
+  await band.press({ key: 'window-300000' })
+  expect(calls).toEqual(['300000', '400000'])
+  expect(saved['compact.window']).toBe(400_000)
+  await clock.advance(31_000)
+  expect(calls).toEqual(['300000', '400000'])
+  expect(saved['compact.window']).toBe(400_000)
+  expect(saved['compact.window.model.claude-opus-5-5']).toBe(400_000)
+  await band.unmount()
+})
+
+test('a pick pressed while an earlier one is being written wins, and its own earlier save does not stop it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = { 'compact.window': 200_000, 'compact.window.model.claude-opus-5-5': 200_000 }
+  let pressDuring: (() => Promise<unknown>) | null = null
+  let later: Promise<unknown> = Promise.resolve()
+  // The newer press reads the shared pick (still 200k) and starts its command; only then does the
+  // older 300k reach the store, and the newer command ends after that.
+  let entered = (): void => {}
+  let written = (): void => {}
+  const inCommand = new Promise<void>(r => (entered = r))
+  const afterWrite = new Promise<void>(r => (written = r))
+  on('store.keys', () => ({ value: Object.keys(saved) }))
+  on('store.get', (_, e) => ({ value: saved[e.key] }))
+  on('store.set', async (_, e) => {
+    if (e.key === 'compact.window' && pressDuring) {
+      const press = pressDuring
+      pressDuring = null
+      later = press()
+      await inCommand
+    }
+    saved[e.key] = e.value
+    if (e.key === 'compact.window') written()
+    return { value: undefined }
+  })
+  session(on, { tokens: 120_000 })
+  const calls: string[] = []
+  on('command.run', { command: 'autocompact' }, async (_, e) => {
+    calls.push(String(e.args))
+    if (String(e.args) === '400000') {
+      entered()
+      await afterWrite
+    }
+    return { text: SET(String(e.args)) } as never
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  await band.press({ key: 'open-settings' })
+  pressDuring = () => band.press({ key: 'window-400000' })
+  await band.press({ key: 'window-300000' })
+  await later
+  expect(saved['compact.window']).toBe(400_000)
+  await clock.advance(31_000)
+  await clock.advance(31_000)
+  expect(calls).toEqual(['300000', '400000'])
+  expect(saved['compact.window']).toBe(400_000)
+  expect(saved['compact.window.model.claude-opus-5-5']).toBe(400_000)
+  await band.unmount()
+})
+
+test('a threshold that fails to read after the window changed is hidden, and read again on the next tick', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  let fail = false
+  let bd: object = breakdownAt(1_000_000, 'model-default')
+  const usage = {
+    tokens: 100_000,
+    model: 'claude-opus-5-5',
+    get breakdown(): object {
+      if (fail) throw new Error('API')
+      return bd
+    },
+  }
+  session(on, usage)
+  const calls: string[] = []
+  autocompact(on, calls, SET)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^стисне на / }))?.text).toMatch(/^стисне на 967k/)
+  fail = true
+  bd = breakdownAt(200_000)
+  await band.press({ key: 'open-settings' })
+  await band.press({ key: 'window-200000' })
+  expect(calls).toEqual(['200000'])
+  await band.press({ key: 'open-details' })
+  expect(await band.find({ type: 'Text', text: /^стисне на 967k/ })).toBeUndefined()
+  fail = false
+  await clock.advance(31_000)
+  expect((await band.find({ type: 'Text', text: /^стисне на / }))?.text).toMatch(/^стисне на 167k/)
+  await band.unmount()
+})
+
+test('a threshold the engine does not give after a switch of model is hidden and read again later', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const usage: { tokens: number; model: string; breakdown?: object } = { tokens: 100_000, model: 'claude-opus-5-5', breakdown: breakdownAt(200_000) }
+  session(on, usage)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^стисне на / }))?.text).toMatch(/^стисне на 167k/)
+
+  usage.model = 'claude-sonnet-5-5'
+  usage.breakdown = undefined
+  await clock.advance(31_000)
+  expect(await band.find({ type: 'Text', text: /^стисне на / })).toBeUndefined()
+  usage.breakdown = breakdownAt(1_000_000, 'model-default')
+  await clock.advance(31_000)
+  expect((await band.find({ type: 'Text', text: /^стисне на / }))?.text).toMatch(/^стисне на 967k/)
+  await band.unmount()
+})
+
+test('a threshold read that fails after a switch of model hides the old one and is tried again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  let fail = false
+  let bd: object = breakdownAt(200_000)
+  const usage = {
+    tokens: 100_000,
+    model: 'claude-opus-5-5',
+    get breakdown(): object {
+      if (fail) throw new Error('API')
+      return bd
+    },
+  }
+  session(on, usage)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^стисне на / }))?.text).toMatch(/^стисне на 167k/)
+
+  fail = true
+  usage.model = 'claude-sonnet-5-5'
+  bd = breakdownAt(1_000_000, 'model-default')
+  await clock.advance(31_000)
+  expect(await band.find({ type: 'Text', text: /^стисне на / })).toBeUndefined()
+  fail = false
+  await clock.advance(31_000)
+  expect((await band.find({ type: 'Text', text: /^стисне на / }))?.text).toMatch(/^стисне на 967k/)
+  await band.unmount()
+})
+
+test('a switch of model brings the threshold of the new model into the details', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const usage: { tokens: number; model?: string; breakdown: object } = { tokens: 100_000, breakdown: breakdownAt(200_000) }
+  session(on, usage)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^стисне на / }))?.text).toMatch(/^стисне на 167k/)
+
+  // /model: no reply yet, the timer notices the new model.
+  usage.model = 'claude-sonnet-5-5'
+  usage.breakdown = breakdownAt(1_000_000, 'model-default')
+  await clock.advance(31_000)
+  expect((await band.find({ type: 'Text', text: /^стисне на / }))?.text).toMatch(/^стисне на 967k/)
+  await band.unmount()
+})
+
+test('the details show where the engine compacts and in about how many turns', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  const usage = { tokens: 100_000, breakdown: breakdownAt(200_000) as object }
+  session(on, usage)
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  // A reply as the app tells it: the turn ends, then the engine measures the new context.
+  const reply = async (turnId: string, tokens: number) => {
+    usage.tokens = tokens
+    await $.turn.complete({ ...ANSWERED, turnId })
+    await $.session.measure({ context: { tokens, window: 1_000_000 }, rateLimits: [], changed: ['context'] })
+  }
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await reply('t1', 100_000)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'toggle' })
+  expect((await band.find({ type: 'Text', text: /^Поріг$/ }))?.text).toBe('Поріг')
+  expect((await band.find({ type: 'Text', text: /^стисне на / }))?.text).toBe('стисне на 167k (84% вікна) · вікно 200k, з налаштувань')
+
+  // Two replies 20k apart: (167k − 120k) / 20k ≈ 3 turns.
+  await reply('t3', 120_000)
+  expect((await band.find({ type: 'Text', text: /^стисне на / }))?.text).toBe('стисне на 167k (84% вікна) · ≈ через 3 ходи · вікно 200k, з налаштувань')
+
+  await reply('t4', 170_000)
+  expect((await band.find({ type: 'Text', text: /^стисне на / }))?.text).toMatch(/· уже на порозі: стисне найближчим часом ·/)
+
+  usage.breakdown = breakdownAt(200_000, 'settings', false)
+  await reply('t5', 170_000)
+  expect((await band.find({ type: 'Text', text: /^автостиснення рушія/ }))?.text).toBe('автостиснення рушія вимкнено · autoCompactEnabled у налаштуваннях')
+  await band.unmount()
+})
+
+const ownPlugin = (on: On, version: string) =>
+  on('fs.read', (_, e) => {
+    if (!String(e.path).endsWith('plugin.json')) throw new Error('not here')
+    return { value: JSON.stringify({ name: 'gmdi-token-meter', version }) } as never
+  })
+
+test('a first install opens the pages; the recommended choice sets 200k and every setting, then closes', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  storeIn(on, saved)
+  session(on, { tokens: 50_000, breakdown: breakdownAt(200_000, 'model-default') })
+  ownPlugin(on, '0.5.0')
+  const toasts: string[] = []
+  toastsIn(on, toasts)
+  const calls: string[] = []
+  autocompact(on, calls, SET)
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^Вітаю!/ }))?.text).toMatch(/^Вітаю! Це смуга/)
+  expect((await band.find({ type: 'Text', text: /знайомство$/ }))?.text).toBe('ⓘ gmdi-token-meter 0.5.0 — знайомство')
+  expect((await band.find({ type: 'Text', text: /^1\/5$/ }))?.text).toBe('1/5')
+
+  await band.press({ key: 'intro-next' })
+  expect((await band.find({ type: 'Text', text: /^Смуга$/ }))?.text).toBe('Смуга')
+  await band.press({ key: 'intro-next' })
+  await band.press({ key: 'intro-next' })
+  expect((await band.find({ type: 'Text', text: /^• 200k ★/ }))?.text).toMatch(/рекомендовано/)
+  expect((await band.find({ type: 'Text', text: /^зараз у цій сесії/ }))?.text).toBe('зараз у цій сесії: стисне на 167k (84% вікна)')
+  await band.press({ key: 'intro-next' })
+  expect((await band.find({ type: 'Text', text: /^Які налаштування/ }))?.text).toBe('Які налаштування обираєте?')
+
+  await band.press({ key: 'intro-recommended' })
+  expect(saved['intro.seen']).toBe('0.5.0')
+  expect(saved['compact.window']).toBe(200_000)
+  expect(saved['warm.max']).toBe(4)
+  expect(saved['compact.at']).toBe(15)
+  expect(saved['show.week']).toBe(true)
+  expect(calls).toEqual(['200000'])
+  expect(toasts).toContain('★ Рекомендовані налаштування застосовано')
+  expect(await band.find({ type: 'Text', text: /^Які налаштування/ })).toBeUndefined()
+  await band.unmount()
+})
+
+test('after an update the pages say what is new; «Пізніше» leaves them for next time, «Свої» opens ⚙', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = { lang: 'uk', 'warm.max': 2 }
+  storeIn(on, saved)
+  session(on, { tokens: 50_000 })
+  ownPlugin(on, '0.5.0')
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^Мод оновлено/ }))?.text).toBe('Мод оновлено до 0.5.0. Що нового:')
+  await band.press({ key: 'intro-later' })
+  expect(await band.find({ type: 'Text', text: /^Мод оновлено/ })).toBeUndefined()
+  expect(saved['intro.seen']).toBeUndefined()
+
+  // «ⓘ Про мод» brings them back; «До вибору», then «Свої» keeps the person's settings.
+  await band.press({ key: 'toggle' })
+  await band.press({ key: 'about' })
+  expect((await band.find({ type: 'Text', text: /^Вітаю!/ }))?.text).toMatch(/^Вітаю!/)
+  await band.press({ key: 'intro-skip' })
+  await band.press({ key: 'intro-own' })
+  expect(saved['intro.seen']).toBe('0.5.0')
+  expect(saved['warm.max']).toBe(2)
+  expect((await band.find({ type: 'Text', text: /^Поріг автостиснення:$/ }))?.text).toBe('Поріг автостиснення:')
+  await band.unmount()
+})
+
+test('the pages seen for this version stay closed, and in English they read in English', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  storeIn(on, { 'intro.seen': '0.5.0', lang: 'en' })
+  session(on, { tokens: 50_000 })
+  ownPlugin(on, '0.5.0')
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await band.find({ type: 'Text', text: /getting started$/ })).toBeUndefined()
+  await band.press({ key: 'toggle' })
+  await band.press({ key: 'about' })
+  expect((await band.find({ type: 'Text', text: /getting started$/ }))?.text).toBe('ⓘ gmdi-token-meter 0.5.0 — getting started')
+  // Opened by hand: the timer leaves it open until the person closes it.
+  await clock.advance(2 * 60_000)
+  expect((await band.find({ type: 'Text', text: /getting started$/ }))?.text).toBe('ⓘ gmdi-token-meter 0.5.0 — getting started')
+  await band.unmount()
+})
+
+test('any key an older mod stored means an update; a first install marks itself and greets again later', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = { 'usage.shared': { next: 0 } }
+  storeIn(on, saved)
+  session(on, { tokens: 50_000 })
+  ownPlugin(on, '0.5.0')
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^Мод оновлено/ }))?.text).toBe('Мод оновлено до 0.5.0. Що нового:')
+  expect(saved['intro.new']).toBeUndefined()
+  await band.unmount()
+})
+
+test('a first install left for later still greets in the next session, though the mod stored more by then', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const saved: Record<string, unknown> = {}
+  storeIn(on, saved)
+  session(on, { tokens: 50_000 })
+  ownPlugin(on, '0.5.0')
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(saved['intro.new']).toBe('0.5.0')
+  saved['usage.shared'] = { next: 0 }
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^Вітаю!/ }))?.text).toMatch(/^Вітаю! Це смуга/)
+  await band.unmount()
+})
+
+test('a first install left for later, then updated, says what is new rather than greeting', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  storeIn(on, { 'intro.new': '0.5.0', 'usage.shared': { next: 0 } })
+  session(on, { tokens: 50_000 })
+  ownPlugin(on, '0.6.0')
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^Мод оновлено/ }))?.text).toBe('Мод оновлено до 0.6.0. Що нового:')
+  expect(await band.find({ type: 'Text', text: /^Вітаю!/ })).toBeUndefined()
   await band.unmount()
 })

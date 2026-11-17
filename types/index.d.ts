@@ -35,6 +35,10 @@ export type CompactAt = 0 | 10 | 15 | 20
 // The least a cold restart must cost, in dollars, before compacting is offered.
 export type CompactMin = 0.5 | 1 | 2 | 5
 
+// The engine's auto-compact window the mod sets with /autocompact, in tokens; 0 leaves the engine's own.
+// The engine compacts at the window less a fixed 33k buffer: 200k compacts at 167k.
+export type CompactWindow = 0 | 100000 | 200000 | 300000 | 400000
+
 export type Settings = {
   lang: Lang
   ttl: '1h' | '5m'
@@ -45,6 +49,7 @@ export type Settings = {
   compactMin: CompactMin
   // Compact on its own once the cache is about to cool and the session is idle; off by default.
   compactAuto: boolean
+  compactWindow: CompactWindow
   show: Blocks
 }
 
@@ -56,7 +61,7 @@ export type Plan = 'bearer' | 'api-key' | 'other' | 'unknown'
 // reports it, in major units (dollars): `limit` null is no monthly cap.
 export type Extra = { enabled: boolean; limit: number | null; used: number | null; currency: string; at: number }
 
-export type View = 'closed' | 'details' | 'settings'
+export type View = 'closed' | 'details' | 'settings' | 'intro'
 
 // The warmer in this session: paused by the person, and how many prompts it sent since their last one.
 export type Warm = { paused: boolean; done: number; lastAt: number | null }
@@ -73,6 +78,17 @@ export type Compaction = {
   dismissedFor: number | null
   autoFor: number | null
 }
+
+// The engine's auto-compact threshold for the session's model, read from its context breakdown:
+// `at` is null when auto-compaction is off; `window` is what it is measured against.
+export type Threshold = { at: number | null; window: number; source: string }
+
+// How the context grew per answered turn, for the «compacts in ≈N turns» forecast.
+export type Growth = { last: number | null; avg: number | null }
+
+// The getting-to-know-the-mod pages: shown once per version, on install and on every update.
+// `from` is the version seen before ('old' for one before 0.5.0, null for a first install).
+export type Intro = { version: string | null; from: string | null; page: number; manual: boolean }
 
 // What earlier compactions on this computer came to: the context after one, the summary's length.
 export type Learned = { after: number | null; out: number | null }
@@ -96,6 +112,9 @@ declare module 'claude-code' {
       spend: number | null
       compaction: Compaction
       learned: Learned
+      threshold: Threshold | null
+      growth: Growth
+      intro: Intro
     }
   }
 }

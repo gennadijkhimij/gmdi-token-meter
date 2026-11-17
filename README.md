@@ -49,6 +49,38 @@
 - **Точність.** Розмір контексту після стиснення (70k) і довжина підсумку (8k) спершу оцінкові. Після першого стиснення на цьому комп'ютері мод запам'ятовує справжні числа (розмір — той, що назвав рушій, а якщо рушій його не назвав, — з відповіді на наступний хід; навіть якщо контекст лишився великим) і бере їх для наступних оцінок. Кеш підсумку прив'язаний до моделі сесії: якщо після стиснення перемкнути `/model`, смуга покаже ХОЛОД. Це стосується й стиснень, які ви робите самі через `/compact`, якщо мод їх чує: інший плагін, який обробляє стиснення раніше за мод (наприклад, плагін безпеки організації), може їх від мода приховати. Після стиснення в застосунку рушій не знає розміру контексту до наступної відповіді; до того смуга рахує за оцінкою.
 - **Обмеження.** Стиснення замінює розмову підсумком, і дрібні подробиці губляться. Рушій не дає стискати посеред ходу, тому мод чекає, поки сесія простоює. Ціни — за прайсом API; на підписці це міра витраченого ліміту.
 
+## Поріг автостиснення
+
+Рушій Claude Code стискає розмову сам, коли контекст доходить до **вікна автостиснення мінус ≈33k**. Типове вікно — повне вікно моделі, тож на моделі з 1M розмова розростається майже до мільйона токенів, і кожен запит читає весь цей контекст.
+
+- **⚙ «Поріг автостиснення»:** як у рушія / 100k / ★ 200k (рекомендовано) / 300k / 400k. Натискання одразу виконує команду рушія `/autocompact <N>`, без перезапуску. Рушій сам записує вибір для моделі в `settings.json` (`modelSettings.<модель>.autoCompactWindow`). «Як у рушія» виконує `/autocompact auto`. Якщо рушій відмовив (наприклад, задано змінну `CLAUDE_CODE_AUTO_COMPACT_WINDOW`), причина з'явиться у сповіщенні, а вибір не збережеться.
+- **Інші сесії** отримують вибір самі, коли простоюють, один раз для кожної моделі.
+
+| вікно | стисне на | |
+|---|---|---|
+| 100k | ≈67k | найекономніше, частіші підсумки |
+| ★ 200k | ≈167k | рекомендовано: баланс пам'яті розмови й ліміту |
+| 300k / 400k | ≈267k / ≈367k | лише для моделей з вікном 1M |
+
+- **▾ → «Поріг»:** «стисне на 167k (84% вікна) · ≈ через 3 ходи · вікно 200k, з налаштувань». Прогноз рахується за середнім ростом контексту на відповідь; прогріви в ньому не враховуються. Якщо автостиснення рушія вимкнено (`autoCompactEnabled`), рядок про це скаже.
+
+## Знайомство при встановленні й оновленні
+
+Після встановлення і після кожного оновлення смуга один раз відкриває 5 коротких сторінок:
+
+1. що це за мод;
+2. що показує смуга;
+3. можливості: прогрівач, попередження, стиснення;
+4. поріг автостиснення;
+5. вибір налаштувань.
+
+Після оновлення перша сторінка каже, що нового в цій версії. Наприкінці мод питає, які налаштування обрати:
+
+- **★ Рекомендовані розробником:** поріг 200k, прогрівач 4 рази, пропозиція стиснення за 15 хв, усі блоки.
+- **Свої:** наявні налаштування лишаються, відкривається ⚙.
+
+«Пізніше» закриває сторінки до наступної сесії. ▾ → «ⓘ Про мод» відкриває їх будь-коли.
+
 ## Встановлення
 
 **Windows, одним кліком (рекомендовано).** Завантажте [`windows/install.bat`](windows/install.bat) і [`windows/install.ps1`](windows/install.ps1) в одну теку, запустіть `install.bat` і перезапустіть Claude. Скрипт підключає мод у всіх акаунтах Claude на комп'ютері та вмикає автооновлення. Стару копію з архіву-інсталятора (`%LOCALAPPDATA%\claude-mods\gmdi-token-meter`) він прибирає. Перед зміною `settings.json` робить резервну копію.
@@ -101,6 +133,10 @@ A mod for Claude Code (the Claude desktop app's Code tab and the terminal): a ba
 **Cache warmer.** Five minutes before the TTL runs out (one minute at 5m) the mod sends a one-word prompt that reads the cache and renews it, up to 4 times in a row by default (2, 8 or off in ⚙). Your next prompt restarts the count. It skips while Claude is working, below 20k context, below 10 % of the 5H limit or 5 % of the weekly one, and once the cache is cold. Each warm-up is a model turn and counts against your usage.
 
 **Compact while the cache is warm.** With a large conversation, the first request after the cache cools writes the whole context again (804k tokens on Opus 5.5 ≈ $6.43), while compacting costs one warm read plus the summary (≈ $0.32), and the cold start after it rewrites only the summary and system prompt (≈ $0.56). When the cache is warm, cools within 15 minutes (10/15/20 or off in ⚙), a cold start would cost over $1 (0.5/1/2/5 in ⚙) and compacting halves that at least, a row under the band offers it: `⚠ cache cools in 14m: compact now ≈$0.32, then a cold start ≈$0.56 instead of $6.43 [⇲ Compact now] not now`. The button runs the same compaction as `/compact`: `$.session.compact()` in the terminal; the desktop app does not allow mods that call, so there the mod runs the `/compact` command itself (`$.command.run`), shown in the conversation as `/compact … Compacted`; it waits while Claude is working (also when a reply starts while it gets ready) and reports a veto (from any hook, in both cases) or failure. Auto-compact (off by default in ⚙) compacts an idle session five minutes before the cache cools (one minute at 5m), once per cache. While the warmer keeps the cache, there is no offer; the details say how long a break warming still beats compacting (warm-ups are counted whole, each one TTL less the warmer's lead apart). When the warmer is off, paused, used up or standing down on a low limit, the offer says so. The size after compaction (70k) and the summary length (8k) start as estimates and are learned from the first real compaction on the computer: the size the engine names, or, when it names none, the one the next turn's reply measures, however large (your own `/compact` counts too, unless a plugin that handles compaction before this mod hides it). A summary replaces the conversation in detail.
+
+**Auto-compact threshold.** The engine compacts on its own at the auto-compact window less ≈33k; by default the window is the model's whole one, so on a 1M model a session grows to nearly a million tokens. ⚙ «Auto-compact threshold» offers engine default / 100k / ★ 200k (recommended) / 300k / 400k (the last two only matter on 1M models). A press runs the engine's `/autocompact <N>` at once, with no restart, and the engine saves it per model in `settings.json`; a refusal (for one, `CLAUDE_CODE_AUTO_COMPACT_WINDOW` set) comes as a toast and nothing is saved. Other open sessions apply it when idle. ▾ → «Threshold» reads «compacts at 167k (84% of the window) · ≈ in 3 turns · window 200k, from settings».
+
+**Getting started.** After an install and after every update the band opens five short pages once: what the mod is, the band, what it can do, the threshold, and a choice: ★ the developer's recommended settings (200k, warmer ×4, compact offer at 15 min, every block) or your own (kept as they are; ⚙ opens). After an update the first page says what is new. «Later» leaves them for the next session; ▾ → «ⓘ About» brings them back.
 
 **Install.** In a Claude Code terminal session:
 

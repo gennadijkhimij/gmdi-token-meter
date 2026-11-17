@@ -11,7 +11,28 @@ import type {
   SessionRateLimit,
 } from 'claude-code'
 
-import type { Blocks, Budget, CompactAt, CompactMin, Compaction, Context, Extra, Lang, Learned, Limit, Plan, Settings, View, Warm, WarmMax, WarnAt } from '../types'
+import type {
+  Blocks,
+  Budget,
+  CompactAt,
+  CompactMin,
+  Compaction,
+  CompactWindow,
+  Context,
+  Extra,
+  Growth,
+  Intro,
+  Lang,
+  Learned,
+  Limit,
+  Plan,
+  Settings,
+  Threshold,
+  View,
+  Warm,
+  WarmMax,
+  WarnAt,
+} from '../types'
 import { LANG_NAMES, TEXT } from './i18n'
 import type { Strings } from './i18n'
 
@@ -39,6 +60,11 @@ const NO_COMPACTION: Compaction = { state: 'idle', at: null, before: null, after
 // This session's last compaction, and what compactions on this computer came to (from the store).
 const compaction = atom({ plugin: 'gmdi-token-meter', key: 'compaction' } as const, NO_COMPACTION)
 const learned = atom({ plugin: 'gmdi-token-meter', key: 'learned' } as const, { after: null, out: null } as Learned)
+// The engine's auto-compact threshold and how fast the context grows toward it.
+const threshold = atom({ plugin: 'gmdi-token-meter', key: 'threshold' } as const, null as Threshold | null)
+const growth = atom({ plugin: 'gmdi-token-meter', key: 'growth' } as const, { last: null, avg: null } as Growth)
+// The getting-to-know-the-mod pages: this version, the one seen before, the page open.
+const intro = atom({ plugin: 'gmdi-token-meter', key: 'intro' } as const, { version: null, from: null, page: 0, manual: false } as Intro)
 
 // A details fact: colored, plain (strong) or dim.
 type Fact = { text: string; color?: string; strong?: boolean }
@@ -47,7 +73,7 @@ type Fact = { text: string; color?: string; strong?: boolean }
 // change in one session never overwrites what another session changed. The one
 // object under 'settings' is how 0.1 kept them: read as the base, never written.
 const LEGACY_KEY = 'settings'
-type SettingKey = 'lang' | 'ttl' | 'warm.max' | 'warn.at' | 'money.budget' | 'compact.at' | 'compact.min' | 'compact.auto' | `show.${keyof Blocks}`
+type SettingKey = 'lang' | 'ttl' | 'warm.max' | 'warn.at' | 'money.budget' | 'compact.at' | 'compact.min' | 'compact.auto' | 'compact.window' | `show.${keyof Blocks}`
 const DOTS = 10
 const DIM = '#5b5b5b'
 // The details' label column, in cells: fits «Тиждень» / «Session» and a gap.
@@ -91,6 +117,23 @@ const COMPACT_GAIN = 0.5
 const STORE_AFTER = 'compact.learned.after'
 const STORE_OUT = 'compact.learned.out'
 
+// The engine's auto-compact window, set with its own /autocompact for the session's model (live, saved
+// in the user's settings under modelSettings). It compacts at the window less a fixed 33k buffer;
+// a window past the model's limit is capped to it. 0 leaves the engine's own.
+const COMPACT_WINDOW_CHOICES: readonly CompactWindow[] = [0, 100_000, 200_000, 300_000, 400_000]
+const RECOMMENDED_WINDOW: CompactWindow = 200_000
+const COMPACT_BUFFER = 33_000
+// The window the mod set for a model: 'compact.window.model.<model>' = 200000 (0: none). A key per
+// model, so two sessions setting different models never overwrite each other's record.
+const STORE_WINDOWS = 'compact.window.model.'
+// The version whose getting-to-know pages the person has been through.
+const STORE_INTRO = 'intro.seen'
+// The version first installed, set before the mod stores anything else: tells a later version that
+// it is an update, even when the pages were left for later.
+const STORE_INTRO_NEW = 'intro.new'
+// The getting-to-know pages: welcome or what is new, the band, cache and compacting, the threshold, the choice.
+const INTRO_LAST = 4
+
 const defaults = (ttl: '1h' | '5m'): Settings => ({
   lang: 'uk',
   ttl,
@@ -100,6 +143,7 @@ const defaults = (ttl: '1h' | '5m'): Settings => ({
   compactAt: 15,
   compactMin: 1,
   compactAuto: false,
+  compactWindow: 0,
   show: { label: true, week: true, fiveHour: true, reset: true, words: true, cache: true, price: true, money: true, forecast: true, priceDetails: true, models: true, session: true },
 })
 
@@ -117,6 +161,7 @@ const withDefaults = (stored: unknown, ttl: '1h' | '5m'): Settings => {
     compactAt?: unknown
     compactMin?: unknown
     compactAuto?: unknown
+    compactWindow?: unknown
     show?: unknown
   }
   const shown = s.show && typeof s.show === 'object' ? (s.show as Record<string, unknown>) : {}
@@ -134,6 +179,7 @@ const withDefaults = (stored: unknown, ttl: '1h' | '5m'): Settings => {
     compactAt: COMPACT_AT_CHOICES.find(n => n === s.compactAt) ?? base.compactAt,
     compactMin: COMPACT_MIN_CHOICES.find(n => n === s.compactMin) ?? base.compactMin,
     compactAuto: typeof s.compactAuto === 'boolean' ? s.compactAuto : base.compactAuto,
+    compactWindow: COMPACT_WINDOW_CHOICES.find(n => n === s.compactWindow) ?? base.compactWindow,
     show,
   }
 }
@@ -352,7 +398,9 @@ const valueOf = (s: Settings, key: SettingKey): unknown =>
                 ? s.compactMin
                 : key === 'compact.auto'
                   ? s.compactAuto
-                  : s.show[key.slice('show.'.length) as keyof Blocks]
+                  : key === 'compact.window'
+                    ? s.compactWindow
+                    : s.show[key.slice('show.'.length) as keyof Blocks]
 
 const why = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
@@ -374,6 +422,7 @@ async function loadSettings($: EngineInterface, ttl: '1h' | '5m'): Promise<Setti
     if (keys.has('compact.at')) raw.compactAt = await $.store.get('compact.at')
     if (keys.has('compact.min')) raw.compactMin = await $.store.get('compact.min')
     if (keys.has('compact.auto')) raw.compactAuto = await $.store.get('compact.auto')
+    if (keys.has('compact.window')) raw.compactWindow = await $.store.get('compact.window')
     for (const block of Object.keys(defaults(ttl).show)) {
       if (keys.has(`show.${block}`)) raw.show[block] = await $.store.get(`show.${block}`)
     }
@@ -407,6 +456,382 @@ async function change($: EngineInterface, ttl: '1h' | '5m', key: SettingKey, fn:
   await saving
 }
 
+// Changes several settings at once (the developer's recommended set): one redraw, every key written.
+async function changeAll($: EngineInterface, ttl: '1h' | '5m', keys: readonly SettingKey[], fn: (s: Settings) => Settings) {
+  await update($, settings, s => fn((s as Settings | null) ?? defaults(ttl)))
+  saving = saving.then(() => persist($, keys))
+  await saving
+}
+
+// The model whose threshold the «Поріг» row shows (module state): another model's is never shown,
+// and a failed read is tried again on the next tick.
+let thresholdModel: string | null = null
+
+// The engine's auto-compact threshold for the session's model, from its context breakdown.
+// An engine without the breakdown leaves the last reading (or none: the details skip the row).
+async function refreshThreshold($: EngineInterface) {
+  let id: string | null = null
+  try {
+    id = await $.session.model()
+    const b = (await $.session.usage({ breakdown: 'summary' })).context.breakdown
+    if (!b) {
+      // No reading yet: another model's is hidden, and the next tick tries again.
+      if (thresholdModel !== id) {
+        await update($, threshold, () => null)
+        thresholdModel = null
+      }
+      return
+    }
+    await update($, threshold, () => ({
+      at: b.isAutoCompactEnabled && typeof b.autoCompactThreshold === 'number' ? b.autoCompactThreshold : null,
+      window: b.rawMaxTokens,
+      source: b.autocompactSource,
+    }))
+    thresholdModel = id
+  } catch {
+    // A reading for this model and window stays; any other is hidden until read again.
+    if (thresholdModel !== id) {
+      await update($, threshold, () => null)
+      thresholdModel = null
+    }
+  }
+}
+
+// The window this mod set for a model, shared by every session on this computer; 0 when none.
+async function readWindow($: EngineInterface, id: string): Promise<number> {
+  const stored = await $.store.get(STORE_WINDOWS + modelKey(id))
+  return typeof stored === 'number' ? stored : 0
+}
+
+async function markWindow($: EngineInterface, id: string, n: CompactWindow) {
+  try {
+    await $.store.set(STORE_WINDOWS + modelKey(id), n)
+  } catch {
+    // Without a store the next session sets the window again: harmless.
+  }
+}
+
+// The window as picked in any session, read fresh: a session started earlier must not act on an
+// old pick. null when the store cannot be read or holds something else.
+async function sharedWindow($: EngineInterface): Promise<CompactWindow | null> {
+  try {
+    const stored = await $.store.get('compact.window')
+    if (stored === undefined || stored === null) return 0
+    return COMPACT_WINDOW_CHOICES.find(n => n === stored) ?? null
+  } catch {
+    return null
+  }
+}
+
+// Setting the window runs the engine's own /autocompact, which saves it for the session's model
+// (modelSettings in the user's settings) and applies it at once. Module state, like `busy`.
+let applying = false
+// The model and window this session has already checked against the store.
+let checkedWindow: string | null = null
+// A window the person picked here while the session was busy: the timer sets it once idle, and only
+// then is it saved as the pick; a refusal drops it, and the earlier pick stays.
+// `base` and `at`: the shared pick when it was pressed, and the time; a pick saved by another
+// session after that drops it (by time, so a pick changed and changed back counts too).
+let pendingWindow: Press | null = null
+
+// One press of a threshold in this session: `press` counts the presses here, `base` and `at` say
+// which shared pick it saw. Only the newest press here, with no pick saved elsewhere since, is saved.
+type Press = { n: CompactWindow; ttl: '1h' | '5m'; base: CompactWindow | null; at: number; press: number }
+let presses = 0
+
+// When the shared pick was last saved (0: never, or a mod before 0.5.0).
+async function pickedAt($: EngineInterface): Promise<number> {
+  try {
+    const stored = await $.store.get('compact.window.at')
+    return typeof stored === 'number' ? stored : 0
+  } catch {
+    return 0
+  }
+}
+
+// The shared pick is still the one this press saw: no other session picked since.
+// This session's own save of an older press counts as no change for a newer press here.
+async function stillBase($: EngineInterface, p: Press): Promise<boolean> {
+  const at = await pickedAt($)
+  if (ownSave && at === ownSave.at && ownSave.press < p.press) return true
+  return (await sharedWindow($)) === p.base && at <= p.at
+}
+
+// The last pick this session saved: its time in the store and its press.
+let ownSave: { at: number; press: number } | null = null
+
+// 'ok': the engine took it; 'later': the session is busy (or another setting is under way), so the
+// timer sets it once idle; 'no': refused or failed, and told.
+type Applied = 'ok' | 'later' | 'no'
+
+// Sets the engine's window to `n` (0: back to the engine's own). `told`: the person pressed it,
+// so the result is told either way; on its own the mod speaks only of a failure.
+async function applyWindow($: EngineInterface, n: CompactWindow, told: boolean): Promise<Applied> {
+  const cfg: Settings = ((await read($, settings)) as Settings | null) ?? defaults('1h')
+  const t: Strings = TEXT[cfg.lang]
+  if (applying) return 'later'
+  applying = true
+  let result: Applied = 'no'
+  try {
+    const id = await $.session.model()
+    // Checked after the last wait, with none between it and the command: a turn may have begun meanwhile.
+    if (busy || warming || compacting) {
+      checkedWindow = null
+      if (told) $.ui.toast(t.windowLater)
+      return 'later'
+    }
+    const out = await $.command.run({ command: 'autocompact', args: n === 0 ? 'auto' : String(n) })
+    const text = out.text?.trim() ?? ''
+    // «Auto-compact window for <model> set to <N> tokens», or back to auto; anything else is a refusal
+    // (the env variable overrides it, an engine without the command).
+    const ok = /^auto-compact window for/i.test(text) || (n === 0 && /\bauto\b/i.test(text) && !/precedence|unknown|error/i.test(text))
+    if (ok) {
+      await markWindow($, id, n)
+      // The reading before is of the old window: read again below, and on every tick until it reads.
+      thresholdModel = null
+      result = 'ok'
+    }
+    if (told || !ok) $.ui.toast(ok ? t.windowToast(text) : t.windowFailed(text || '—'))
+  } catch (err) {
+    $.ui.toast(t.windowFailed(why(err)))
+  } finally {
+    applying = false
+  }
+  await refreshThreshold($)
+  return result
+}
+
+// The window picked in ⚙ goes to every model the session uses: checked once per model and pick,
+// against the record of what the mod has set (so it never fights a window set by hand meanwhile).
+async function maybeApplyWindow($: EngineInterface) {
+  if (busy || warming || compacting || applying) return
+  const cfg = (await read($, settings)) as Settings | null
+  if (!cfg) return
+  // This session's person picked one while the session was busy: it goes first.
+  const pending = pendingWindow
+  if (pending) {
+    // Another session picked after this one was pressed: the newer pick wins, this one is dropped.
+    if (!(await stillBase($, pending))) {
+      if (pendingWindow === pending) pendingWindow = null
+      checkedWindow = null
+      return
+    }
+    const result = await applyWindow($, pending.n, false)
+    if (result === 'later') return
+    // Pressed again here while the command ran: that newer pick goes next, this one is not saved.
+    if (pendingWindow !== pending) {
+      checkedWindow = null
+      return
+    }
+    pendingWindow = null
+    if (result === 'ok') await savePick($, pending)
+    return
+  }
+  // The pick as the store has it now: another session may have changed it since this one started.
+  const pick = await sharedWindow($)
+  if (pick === null) return
+  if (pick !== cfg.compactWindow) {
+    await update($, settings, s => ({ ...(s as Settings), compactWindow: pick }))
+    await refreshThreshold($)
+  }
+  const id = (await read($, model)) ?? (await $.session.model())
+  if (!id) return
+  const key = `${modelKey(id)}:${pick}`
+  if (checkedWindow === key) return
+  checkedWindow = key
+  let have: number
+  try {
+    have = await readWindow($, id)
+  } catch {
+    checkedWindow = null
+    return
+  }
+  // «рушій» (0): only a window this mod set is taken back.
+  if (have === pick) return
+  // Read again just before the command: another session may have picked meanwhile.
+  if ((await sharedWindow($)) !== pick) {
+    checkedWindow = null
+    return
+  }
+  const result = await applyWindow($, pick, false)
+  if (result === 'later') checkedWindow = null
+  // Another session picked while the command ran: the next tick sets its pick instead.
+  else if (result === 'ok' && (await sharedWindow($)) !== pick) checkedWindow = null
+}
+
+// How the context grows per answered turn of the person's (the warmer's turns left out): a moving
+// average for the «compacts in ≈N turns» forecast. A smaller context is a compaction: it starts over.
+async function learnGrowth($: EngineInterface) {
+  let size: number | undefined
+  try {
+    size = (await $.session.usage()).context.tokens
+  } catch {
+    return
+  }
+  if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) return
+  const now = size
+  await update($, growth, g => {
+    const prev = g as Growth
+    if (prev.last === null || now <= prev.last) return { last: now, avg: prev.avg }
+    const delta = now - prev.last
+    return { last: now, avg: prev.avg === null ? delta : 0.7 * prev.avg + 0.3 * delta }
+  })
+}
+
+// This mod's version, from its own plugin.json; null where it cannot be read (the tests).
+async function ownVersion($: EngineInterface): Promise<string | null> {
+  try {
+    const raw = await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`)
+    const v = (JSON.parse(typeof raw === 'string' ? raw : '{}') as { version?: unknown }).version
+    return typeof v === 'string' ? v : null
+  } catch {
+    return null
+  }
+}
+
+// The getting-to-know pages open on their own once per version: after an install and after every
+// update, in each session open then, until one of them is gone through (or «пізніше» each time).
+async function setupIntro($: EngineInterface) {
+  const version = await ownVersion($)
+  if (version === null) return
+  let seen: unknown
+  let keys: string[]
+  try {
+    seen = await $.store.get(STORE_INTRO)
+    keys = await $.store.keys()
+  } catch {
+    return
+  }
+  if (seen === version) return
+  // No version gone through yet. A first install marks itself with its version, so a later session
+  // of it (after «пізніше») still greets, and a later version says «оновлено». Anything else the mod
+  // ever stored, with no such mark: a mod from before 0.5.0 worked here.
+  let from: string | null = typeof seen === 'string' ? seen : null
+  if (from === null) {
+    let first: unknown
+    try {
+      first = keys.includes(STORE_INTRO_NEW) ? await $.store.get(STORE_INTRO_NEW) : undefined
+    } catch {
+      return
+    }
+    if (typeof first === 'string') from = first === version ? null : first
+    else if (first !== undefined) from = null
+    else if (keys.some(k => !k.startsWith('intro.'))) from = 'old'
+    else {
+      try {
+        await $.store.set(STORE_INTRO_NEW, version)
+      } catch {
+        // Without a store the next session greets the same way.
+      }
+    }
+  }
+  await update($, intro, () => ({ version, from, page: 0, manual: false }))
+  await update($, view, () => 'intro')
+}
+
+async function markIntroSeen($: EngineInterface) {
+  const it = (await read($, intro)) as Intro
+  await update($, view, () => 'closed')
+  if (it.version === null) return
+  try {
+    await $.store.set(STORE_INTRO, it.version)
+  } catch {
+    // Without a store the pages come again next session.
+  }
+}
+
+// Another session's person went through the pages: this one closes them too.
+async function syncIntro($: EngineInterface) {
+  if ((await read($, view)) !== 'intro') return
+  const it = (await read($, intro)) as Intro
+  // Opened with «ⓘ Про мод»: the person closes it.
+  if (it.version === null || it.manual) return
+  try {
+    if ((await $.store.get(STORE_INTRO)) === it.version) await update($, view, () => 'closed')
+  } catch {
+    // Stays open.
+  }
+}
+
+// The developer's recommended set: the person's language, TTL and budget stay as they are.
+// The window (★ 200k) is set apart, by setWindow: it is saved only once the engine takes it.
+const RECOMMENDED_KEYS: readonly SettingKey[] = [
+  'warm.max',
+  'warn.at',
+  'compact.at',
+  'compact.min',
+  'compact.auto',
+  ...([...BAND_BLOCKS, ...DETAIL_BLOCKS].map(b => `show.${b}` as const)),
+]
+
+async function applyRecommended($: EngineInterface, ttl: '1h' | '5m') {
+  await changeAll($, ttl, RECOMMENDED_KEYS, s => ({
+    ...s,
+    warmMax: 4,
+    warnAt: 80,
+    compactAt: 15,
+    compactMin: 1,
+    compactAuto: false,
+    show: defaults(ttl).show,
+  }))
+  await markIntroSeen($)
+  const cfg = ((await read($, settings)) as Settings | null) ?? defaults(ttl)
+  $.ui.toast(TEXT[cfg.lang].introDone)
+  // The window is saved as picked only once the engine took it (or will, when the session is idle).
+  await setWindow($, ttl, RECOMMENDED_WINDOW)
+}
+
+async function chooseOwn($: EngineInterface) {
+  await markIntroSeen($)
+  await update($, view, () => 'settings')
+}
+
+async function openIntro($: EngineInterface) {
+  const version = ((await read($, intro)) as Intro).version ?? (await ownVersion($))
+  await update($, intro, () => ({ version, from: null, page: 0, manual: true }))
+  await update($, view, () => 'intro')
+}
+
+// A pick is saved (and shown as picked) only once the engine took it. While the session is busy it
+// waits in this session (pendingWindow) for the timer; a refusal leaves the earlier pick as it was.
+// A press answered after a newer one here neither saves nor waits: the newer pick goes in,
+// on whichever path it took.
+async function setWindow($: EngineInterface, ttl: '1h' | '5m', n: CompactWindow) {
+  const press = ++presses
+  checkedWindow = null
+  pendingWindow = null
+  const base = await sharedWindow($)
+  const at = await $.clock.now()
+  const result = await applyWindow($, n, true)
+  if (press !== presses) {
+    checkedWindow = null
+    return
+  }
+  const mine: Press = { n, ttl, base, at, press }
+  if (result === 'later') pendingWindow = mine
+  else if (result === 'ok') await savePick($, mine)
+}
+
+// The time goes first: a session that reads the new pick reads its time too. Two sessions saving
+// within the same moment end with whichever wrote last, and every session then follows that one.
+// Checked again after every wait: a newer press here, or a pick saved by another session while the
+// command ran, wins; this one is not saved, and the timer then sets the newer one.
+async function savePick($: EngineInterface, p: Press) {
+  checkedWindow = null
+  const now = await $.clock.now()
+  if (p.press !== presses || !(await stillBase($, p))) return
+  ownSave = { at: now, press: p.press }
+  try {
+    await $.store.set('compact.window.at', now)
+  } catch {
+    // The pick itself is still saved below, and a failure there is told.
+  }
+  if (p.press !== presses) return
+  // Checked once more at the write itself: a newer press keeps its own pick.
+  await change($, p.ttl, 'compact.window', s => (p.press === presses ? { ...s, compactWindow: p.n } : s))
+  checkedWindow = null
+}
+
 // The main loop got a response: the prompt cache was read or written just now, for the model
 // that answered (a fallback can answer for the one picked), or the session's when the reply names none.
 async function touch($: EngineInterface, answered: string | undefined) {
@@ -425,9 +850,12 @@ const cacheFrom = (replyAt: number | null, replyId: string | null, modelId: stri
   replyAt !== null && (replyId === null || (modelId !== null && modelKey(replyId) === modelKey(modelId))) ? replyAt : null
 
 // The model the next request goes to (a /model switch included): the price follows it.
+// A switch of model (/model) changes the engine's threshold too: the «Поріг» row follows at once,
+// and a read that failed is tried again on the next tick.
 async function refreshModel($: EngineInterface) {
   const id = await $.session.model()
   await update($, model, () => id)
+  if (thresholdModel !== id) await refreshThreshold($)
 }
 
 // The main loop's turn is running; the warmer's prompt is waiting for its turn to end.
@@ -682,6 +1110,8 @@ async function onTick($: EngineInterface) {
   await update($, tick, n => n + 1)
   await maybeWarm($)
   await maybeCompact($)
+  await maybeApplyWindow($)
+  await syncIntro($)
   await refreshExtra($)
   await checkWarnings($)
 }
@@ -942,6 +1372,8 @@ export const register: Register = (on, options) => {
     if (signedIn === 'api-key') await loadSpend($)
     await loadLearned($)
     await refreshModel($)
+    await refreshThreshold($)
+    await setupIntro($)
     usageReadAt = 0
     await refreshExtra($)
     await checkWarnings($)
@@ -961,6 +1393,8 @@ export const register: Register = (on, options) => {
   // Only a turn the API answered warms the cache: an interrupt or an API error
   // carries no usage, and leaves the cache as it was.
   on('turn.complete', async ($, e, next) => {
+    // The warmer's own turn says nothing of how the person's work grows the context.
+    const wasWarming = warming
     if (!e.agentId) {
       busy = false
       warming = false
@@ -969,6 +1403,8 @@ export const register: Register = (on, options) => {
       await touch($, e.usage.model)
       await refreshModel($)
       await learnSize($)
+      if (!wasWarming) await learnGrowth($)
+      await refreshThreshold($)
     }
 
     return next(e)
@@ -1205,10 +1641,75 @@ export const register: Register = (on, options) => {
       return head
     }
 
-    if (mode === 'settings') {
-      const choice = (key: string, label: string, isOn: boolean, onPress: () => void) => (
-        <Button key={key} plain dimColor={!isOn} label={`${isOn ? '●' : '○'} ${label}`} onPress={onPress} />
+    const choice = (key: string, label: string, isOn: boolean, onPress: () => void) => (
+      <Button key={key} plain dimColor={!isOn} label={`${isOn ? '●' : '○'} ${label}`} onPress={onPress} />
+    )
+    const row = (title: string, items: RenderChildren[]) => (
+      <Box flexDirection="row" alignItems="center" columnGap={1} rowGap={0} flexWrap="wrap">
+        <Text dimColor size="footnote">{`${title}:`}</Text>
+        {items}
+      </Box>
+    )
+    const th = (await read($, threshold)) as Threshold | null
+    const pctOf = (at: number, of: number) => Math.round((at / Math.max(of, 1)) * 100)
+    const windowLabel = (n: CompactWindow) => (n === 0 ? t.windowEngine : `${tokens(n)}${n === RECOMMENDED_WINDOW ? ' ★' : ''}`)
+
+    // Getting to know the mod: a few pages, then the choice of the developer's settings or one's own.
+    if (mode === 'intro') {
+      const it = (await read($, intro)) as Intro
+      const page = Math.min(Math.max(it.page, 0), INTRO_LAST)
+      const go = (p: number) => void update($, intro, s => ({ ...(s as Intro), page: p }))
+      const line = (key: string, text: string, strong = false) => (
+        <Text key={key} size="footnote" dimColor={!strong} weight={strong ? 'semibold' : undefined}>{text}</Text>
       )
+      const body: RenderChildren[] = []
+      if (page === 0) {
+        if (it.from === null) {
+          body.push(line('w-title', t.introWelcomeTitle, true), ...t.introWelcome.map((x, i) => line(`w-${i}`, x)))
+        } else {
+          body.push(line('n-title', t.introNewTitle(it.version ?? ''), true), ...t.introNew.map((x, i) => line(`n-${i}`, `• ${x}`)))
+          body.push(...t.introWelcome.slice(1).map((x, i) => line(`w-${i}`, x)))
+        }
+        body.push(row(t.introHint, (['uk', 'en'] as Lang[]).map(l => choice(`intro-lang-${l}`, LANG_NAMES[l], cfg.lang === l, () => void change($, defaultTtl, 'lang', s => ({ ...s, lang: l }))))))
+      } else if (page < INTRO_LAST) {
+        const p = t.introPages[page - 1]!
+        body.push(line(`p-title`, p.title, true), ...p.lines.map((x, i) => line(`p-${i}`, x)))
+        if (page === INTRO_LAST - 1) {
+          body.push(...t.introWindowLines.map((x, i) => line(`win-${i}`, `• ${x}`)))
+          if (th && th.at !== null) body.push(line('win-now', t.introNow(tokens(th.at), pctOf(th.at, th.window)), true))
+        }
+      } else {
+        body.push(
+          line('c-title', t.introChoiceTitle, true),
+          <Box key="c-rec" flexDirection="row" columnGap={1}>
+            <Button key="intro-recommended" label={t.introRecommended} onPress={() => void applyRecommended($, defaultTtl)} />
+          </Box>,
+          ...t.introRecommendedLines.map((x, i) => line(`c-rec-${i}`, `  ${x}`)),
+          <Box key="c-own" flexDirection="row" columnGap={1}>
+            <Button key="intro-own" plain label={t.introOwn} onPress={() => void chooseOwn($)} />
+          </Box>,
+          line('c-own-note', `  ${t.introOwnNote}`),
+        )
+      }
+      return (
+        <Box flexDirection="column">
+          {head}
+          <Box flexDirection="row" alignItems="center" columnGap={2}>
+            <Text weight="semibold" size="footnote">{t.introTitle(it.version)}</Text>
+            <Text dimColor size="footnote" tabular>{`${page + 1}/${INTRO_LAST + 1}`}</Text>
+          </Box>
+          {body}
+          <Box flexDirection="row" alignItems="center" columnGap={2}>
+            {page > 0 ? <Button key="intro-back" plain dimColor label={t.introBack} onPress={() => go(page - 1)} /> : null}
+            {page < INTRO_LAST ? <Button key="intro-next" plain label={t.introNext} onPress={() => go(page + 1)} /> : null}
+            {page < INTRO_LAST - 1 ? <Button key="intro-skip" plain dimColor label={t.introToChoice} onPress={() => go(INTRO_LAST)} /> : null}
+            <Button key="intro-later" plain dimColor label={t.introLater} onPress={() => void update($, view, () => 'closed')} />
+          </Box>
+        </Box>
+      )
+    }
+
+    if (mode === 'settings') {
       const check = (block: keyof Blocks) => (
         <Button
           key={`show-${block}`}
@@ -1217,12 +1718,6 @@ export const register: Register = (on, options) => {
           label={`${show[block] ? '☑' : '☐'} ${t.blocks[block]}`}
           onPress={() => void change($, defaultTtl, `show.${block}`, s => ({ ...s, show: { ...s.show, [block]: !s.show[block] } }))}
         />
-      )
-      const row = (title: string, items: RenderChildren[]) => (
-        <Box flexDirection="row" alignItems="center" columnGap={1} rowGap={0} flexWrap="wrap">
-          <Text dimColor size="footnote">{`${title}:`}</Text>
-          {items}
-        </Box>
       )
 
       return (
@@ -1243,6 +1738,8 @@ export const register: Register = (on, options) => {
             ...COMPACT_MIN_CHOICES.map(n => choice(`compact-min-${n}`, `$${n}`, cfg.compactMin === n, () => void change($, defaultTtl, 'compact.min', s => ({ ...s, compactMin: n })))),
           ])}
           {row(t.compactAutoRow, ([false, true] as const).map(v => choice(`compact-auto-${v ? 'on' : 'off'}`, v ? t.compactAutoOn : t.warmChoiceOff, cfg.compactAuto === v, () => void change($, defaultTtl, 'compact.auto', s => ({ ...s, compactAuto: v })))))}
+          {row(t.windowRow, COMPACT_WINDOW_CHOICES.map(n => choice(`window-${n}`, windowLabel(n), cfg.compactWindow === n, () => void setWindow($, defaultTtl, n))))}
+          <Text dimColor size="footnote">{`  ${t.windowNote}`}</Text>
           {row(t.bandRow, BAND_BLOCKS.map(check))}
           {row(t.detailsRow, DETAIL_BLOCKS.map(check))}
         </Box>
@@ -1410,6 +1907,22 @@ export const register: Register = (on, options) => {
       { text: t.modelsNote },
     ]
 
+    // The engine's own threshold: where it compacts, in about how many turns, and what sets it.
+    const g = (await read($, growth)) as Growth
+    const thresholdFacts: Fact[] | null = !th
+      ? null
+      : th.at === null
+        ? [{ text: t.thresholdOff, strong: true }, { text: t.thresholdOffNote }]
+        : [
+            { text: t.thresholdAt(tokens(th.at), pctOf(th.at, th.window)), strong: true },
+            ...(ctxTokens >= th.at
+              ? [{ text: t.thresholdNear, color: '#f07a1a' }]
+              : g.avg !== null && g.avg >= 500 && ctxTokens > 0
+                ? [{ text: t.thresholdIn(Math.max(1, Math.ceil((th.at - ctxTokens) / g.avg))) }]
+                : []),
+            { text: t.thresholdWindow(tokens(th.window), (t.sources as Record<string, string>)[th.source] ?? th.source) },
+          ]
+
     const sessionFacts: (Fact | null)[] = [
       { text: (modelId ?? 'claude-opus-5-5').replace(/^claude-/, '') },
       ctx?.tokens !== undefined
@@ -1429,6 +1942,7 @@ export const register: Register = (on, options) => {
         {detail('cache', t.rows.cache, cacheFacts)}
         {detail('warm', t.rows.warm, warmFacts)}
         {ctxTokens > 0 || comp.state !== 'idle' ? detail('compact', t.rows.compact, compactFacts) : null}
+        {thresholdFacts ? detail('threshold', t.thresholdRow, thresholdFacts) : null}
         {show.priceDetails && ctxTokens > 0 ? detail('price', t.rows.price, priceFacts) : null}
         {show.models && ctxTokens > 0 ? detail('models', t.rows.models, modelFacts) : null}
         {show.session ? detail('session', t.rows.session, sessionFacts) : null}
@@ -1436,6 +1950,7 @@ export const register: Register = (on, options) => {
           <Button key="open-settings" plain dimColor label={t.openSettings} onPress={() => void update($, view, () => 'settings')} />
           {cfg.warmMax > 0 ? <Button key="warm-pause" plain dimColor label={w.paused ? t.warmResume : t.warmPause} onPress={toggleWarm} /> : null}
           {canCompact ? <Button key="compact-now" plain label={t.compactButton} onPress={() => void runCompact($, false)} /> : null}
+          <Button key="about" plain dimColor label={t.aboutButton} onPress={() => void openIntro($)} />
         </Box>
       </Box>
     )
